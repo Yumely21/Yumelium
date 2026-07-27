@@ -3,7 +3,9 @@ package com.yumelium.yumelium;
 import com.yumelium.yumelium.proxy.IProxy;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.common.SidedProxy;
+import net.minecraftforge.fml.common.event.FMLPostInitializationEvent;
 import net.minecraftforge.fml.common.event.FMLPreInitializationEvent;
+import net.minecraftforge.fml.relauncher.Side;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -21,6 +23,15 @@ public class YumeliumMod {
     public void preInit(FMLPreInitializationEvent event) {
         LOGGER.info("Hello From {}!", Reference.MOD_NAME);
         proxy.preInit();
+    }
+
+    @Mod.EventHandler
+    public void postInit(FMLPostInitializationEvent event) {
+        // FermiumASM registers its SRG-hardcoded F3 stats handler in loadComplete (AFTER postInit) — install a
+        // one-shot first-tick fixer that pulls it off the bus in dev runtimes (production is left untouched).
+        if (net.minecraftforge.fml.common.FMLCommonHandler.instance().getSide() == Side.CLIENT) {
+            com.yumelium.yumelium.compat.FermiumAsmCompat.install();
+        }
     }
 
 }
