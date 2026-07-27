@@ -73,6 +73,13 @@ public class YumeliumDebugOverlay {
             event.getLeft().add(COLOR + "[" + SHADER_BRAND + "] Shaders: Disabled");
         }
 
+        // EntityCulling stats proxy: the mod's own F3 line targets vanilla GuiOverlayDebug.call(), which Forge's
+        // GuiOverlayDebugForge override never invokes — so we surface its public counters here instead.
+        String ecStats = com.yumelium.yumelium.compat.EntityCullingCompat.debugLine();
+        if (ecStats != null) {
+            event.getLeft().add("§e[EntityCulling] " + ecStats);
+        }
+
         // Nvidium block (green, like the original mod's F3 lines) — only while the backend is actually active.
         // Under shaders it is suspended by design (applyConfig), so this block disappears with the pipeline on.
         if (com.yumelium.yumelium.nvidium.NvidiumBackend.MIRROR

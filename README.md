@@ -17,10 +17,8 @@ Yumelium is a rendering and performance overhaul for Minecraft 1.12.2 running on
   rasterization, including full within-section translucency sorting. Suspended automatically while shaders are on.
 - **Selective Lithium port**: the optimizations that actually help 1.12.2 (collision sweep, entity data tracker,
   pathfinding cache, sine LUT, explosion sweep) — each verified bit-identical to vanilla+Forge behaviour.
-- **Connected glass (CTM)**: clear + 16 stained-glass blocks and panes, switchable Legacy (1.12.2) / New (1.14)
-  texture styles.
-- **Yumelium Plus**: sky/fog/weather toggles, zoom, texture-set switching, Nvidium settings, and an extended F3
-  debug screen (renderer, shadow pass, culling, Nvidium stats).
+- **Yumelium Plus**: sky/fog/weather toggles, zoom, Nvidium settings, and an extended F3 debug screen (renderer,
+  shadow pass, culling, Nvidium stats).
 
 ## Requirements
 
@@ -51,7 +49,7 @@ Lithium (all LGPL-3.0). See [CREDITS.md](CREDITS.md) for full attributions and t
 
 Yumelium は Cleanroom 上の Minecraft 1.12.2 向けに、Sodium(Embeddium 0.5.8 ベース)の地形描画エンジン、
 Iris 互換のシェーダーパイプライン(Complementary Unbound で開発・検証)、Nvidium 方式のメッシュシェーダー描画、
-Lithium の選別移植、接続ガラス(CTM)をひとつにまとめた描画・軽量化 MOD です。
+Lithium の選別移植をひとつにまとめた描画・軽量化 MOD です。
 
 - 前提: Cleanroom 0.5.14-alpha 以降 / Java 21+
 - シェーダーパックは同梱していません。Complementary 等を各公式サイトから入手して `shaderpacks/` に入れてください

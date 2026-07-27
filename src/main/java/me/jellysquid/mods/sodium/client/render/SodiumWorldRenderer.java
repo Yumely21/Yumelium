@@ -535,7 +535,28 @@ public class SodiumWorldRenderer {
         try {
             if (!entityCasters) {
                 // BE-only mode (ENTITY_SHADOW=-1 + PLAYER_SHADOW=-1): skip straight to the TESR loop below.
-            } else if (allEntities) {
+            } else if (!allEntities) {
+                boolean iris$recullView = com.yumelium.yumelium.compat.EntityCullingCompat.beginShadowDraw(view);
+                try {
+                    renderManager.renderEntityStatic(view, partialTicks, false);
+                } finally {
+                    if (iris$recullView) {
+                        com.yumelium.yumelium.compat.EntityCullingCompat.endShadowDraw(view);
+                    }
+                }
+                Entity vehicle = view.getRidingEntity();
+                if (vehicle != null) {
+                    boolean iris$recullVehicle = com.yumelium.yumelium.compat.EntityCullingCompat.beginShadowDraw(vehicle);
+                    try {
+                        renderManager.renderEntityStatic(vehicle, partialTicks, false);
+                    } finally {
+                        if (iris$recullVehicle) {
+                            com.yumelium.yumelium.compat.EntityCullingCompat.endShadowDraw(vehicle);
+                        }
+                    }
+                }
+                this.iris$shadowEntitiesDrawn = vehicle != null ? 2 : 1;
+            } else {
                 // Everything within reach of the shadow ortho box, view entity included (renderEntityStatic has no
                 // first-person skip — that filter lives in RenderGlobal's camera pass). Lightning is excluded: the
                 // pack itself discards its shadow (shadow.glsl, entityId 50004), and a flash-frame full-model shadow
@@ -596,7 +617,16 @@ public class SodiumWorldRenderer {
                             SodiumClientMod.logger().info("[Iris shadow][ENT-STATE] pre  #" + drawn + " "
                                     + entity.getClass().getSimpleName() + (d.isEmpty() ? " clean" : " " + d));
                         }
-                        renderManager.renderEntityStatic(entity, partialTicks, false);
+                        // EntityCulling compat: lift a camera-occlusion cull for the SHADOW draw (the sun's view is
+                        // not the camera's), restore right after — see EntityCullingCompat.
+                        boolean iris$recull = com.yumelium.yumelium.compat.EntityCullingCompat.beginShadowDraw(entity);
+                        try {
+                            renderManager.renderEntityStatic(entity, partialTicks, false);
+                        } finally {
+                            if (iris$recull) {
+                                com.yumelium.yumelium.compat.EntityCullingCompat.endShadowDraw(entity);
+                            }
+                        }
                         // post-draw diff: everything this entity's renderer leaked.
                         if (stateBase != null) {
                             String d = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.diffGlState(
@@ -624,13 +654,6 @@ public class SodiumWorldRenderer {
                 }
                 this.iris$shadowEntitiesDrawn = drawn;
                 this.iris$shadowEntitiesCulled = culled;
-            } else {
-                renderManager.renderEntityStatic(view, partialTicks, false);
-                Entity vehicle = view.getRidingEntity();
-                if (vehicle != null) {
-                    renderManager.renderEntityStatic(vehicle, partialTicks, false);
-                }
-                this.iris$shadowEntitiesDrawn = vehicle != null ? 2 : 1;
             }
             // shadowBlockEntities (ENTITY_SHADOW=2 "すべて"): TESR block entities cast too — chests, beds, skulls,
             // banners, signs, shulker boxes, the enchant-table book, piston moving blocks, the spawner's mini mob.
@@ -671,8 +694,15 @@ public class SodiumWorldRenderer {
                         iris$loadShadowMatrices(matrices);
                         // Explicit-offset overload: skips the dispatcher's stale-camera distance check and its
                         // world.getCombinedLight lookup; camera-relative offsets are exactly what the shadow
-                        // model-view maps to light space.
-                        dispatcher.render(te, pos.getX() - x, pos.getY() - y, pos.getZ() - z, partialTicks);
+                        // model-view maps to light space. EntityCulling compat as in the entity loop above.
+                        boolean iris$recullTe = com.yumelium.yumelium.compat.EntityCullingCompat.beginShadowDraw(te);
+                        try {
+                            dispatcher.render(te, pos.getX() - x, pos.getY() - y, pos.getZ() - z, partialTicks);
+                        } finally {
+                            if (iris$recullTe) {
+                                com.yumelium.yumelium.compat.EntityCullingCompat.endShadowDraw(te);
+                            }
+                        }
                         drawnTe++;
                     } catch (Throwable t) {
                         failedTe++;

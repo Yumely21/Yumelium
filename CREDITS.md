@@ -35,9 +35,7 @@ the following projects:
 
 ## Assets
 
-- The switchable texture sets and generated CTM tiles are derived from **Minecraft** game assets.
-  Minecraft is © Mojang Studios. These assets are NOT covered by this repository's LGPL-3.0 license and are
-  included solely for use with the game.
+- No Minecraft game assets are bundled in this repository.
 - Shader packs (e.g. **Complementary Shaders** by EminGT, **Euphoria Patches** by SpacEagle17) are **not** bundled —
   download them separately from their official pages.
 
