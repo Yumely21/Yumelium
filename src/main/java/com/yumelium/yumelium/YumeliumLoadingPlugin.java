@@ -38,7 +38,12 @@ public class YumeliumLoadingPlugin implements IFMLLoadingPlugin {
 
     @Override
     public void injectData(Map<String, Object> map) {
-
+        // Auto-correct known-incompatible third-party config values (VintageFix entity_disappearing, FermiumASM
+        // loader-surgery toggles) as early as possible — before mixin configs are applied, so VintageFix's mixin
+        // plugin reads the corrected file in this same launch. See ThirdPartyConfigEnforcer for the rules.
+        Object mcLocation = map.get("mcLocation");
+        com.yumelium.yumelium.compat.ThirdPartyConfigEnforcer.enforceAll(
+                mcLocation instanceof java.io.File ? (java.io.File) mcLocation : null);
     }
 
     @Override
