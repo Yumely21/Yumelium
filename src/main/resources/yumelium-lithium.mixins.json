@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "package": "me.jellysquid.mods.lithium.mixin",
+  "compatibilityLevel": "JAVA_8",
+  "target": "@env(DEFAULT)",
+  "mixins": [
+    "ai.pathing.MixinBlockStateImplementation",
+    "ai.pathing.MixinWalkNodeProcessor",
+    "entity.collisions.MixinWorldCollisions",
+    "entity.data_tracker.MixinEntityDataManager",
+    "math.sine_lut.MathHelperAccessor",
+    "math.sine_lut.MixinMathHelper",
+    "world.explosions.MixinExplosion"
+  ]
+}
