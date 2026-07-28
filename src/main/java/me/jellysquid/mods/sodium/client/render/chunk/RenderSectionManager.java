@@ -782,10 +782,20 @@ public class RenderSectionManager {
     }
 
     private float getEffectiveRenderDistance() {
+        var renderDistance = this.getRenderDistance();
+
+        // Eye-in-fluid fog (water/lava) is dense but NOT a wall: the scene above/behind the surface stays clearly
+        // visible through it (especially looking out of shallow water), and 1.12.2 fog has no alpha channel to
+        // prove opacity — FogHelper's 1.0 is synthetic. Culling by the underwater EXP-fog cutoff shrank the world
+        // to ~2 chunks (The Betweenlands, 2026-07-29). Fog occlusion stays for ordinary atmospheric fog only.
+        var view = net.minecraft.client.Minecraft.getMinecraft().getRenderViewEntity();
+        if (view != null && (view.isInsideOfMaterial(net.minecraft.block.material.Material.WATER)
+                || view.isInsideOfMaterial(net.minecraft.block.material.Material.LAVA))) {
+            return renderDistance;
+        }
+
         var color = FogHelper.getFogColor();
         var distance = FogHelper.getFogCutoff();
-
-        var renderDistance = this.getRenderDistance();
 
         // The fog must be fully opaque in order to skip rendering of chunks behind it
         if (!(Math.abs(color[3] - 1.0f) < 1.0E-5F)) {
