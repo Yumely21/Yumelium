@@ -55,8 +55,11 @@ public class ClientProxy implements IProxy {
         // Restore the persisted shader state (enabled + active pack) so a restart keeps the user's selection.
         com.yumelium.yumelium.shaders.ShaderController.restoreState();
 
-        // Iris/Oculus shader-pipeline port — toggle key (K) + cycle-shader-pack key (N).
+        // Iris/Oculus shader-pipeline port — the standard Iris keybinds (rebindable in Options → Controls):
+        // K = toggle shaders, R = reload shaders, O = shader pack selection screen, plus N = cycle pack (our extra).
         ClientRegistry.registerKeyBinding(IrisKeyHandler.TOGGLE_KEY);
+        ClientRegistry.registerKeyBinding(IrisKeyHandler.RELOAD_KEY);
+        ClientRegistry.registerKeyBinding(IrisKeyHandler.PACK_SCREEN_KEY);
         ClientRegistry.registerKeyBinding(IrisKeyHandler.CYCLE_PACK_KEY);
         MinecraftForge.EVENT_BUS.register(IrisKeyHandler.instance());
 

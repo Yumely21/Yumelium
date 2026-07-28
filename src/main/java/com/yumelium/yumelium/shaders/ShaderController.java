@@ -58,6 +58,20 @@ public final class ShaderController {
                 + " (Nvidium " + (on ? "disabled" : "restored") + ", pack '" + activePack() + "')");
     }
 
+    /**
+     * Reloads the active shader pack from disk (Iris's R keybind): drops the compiled pipeline so every program,
+     * properties file and saved option value is re-read on the next frame, then rebuilds the renderer so the terrain
+     * program is recompiled too. Safe while disabled (destroy() is idempotent; the fresh state is simply picked up
+     * on the next enable) — same as Iris, where R reloads regardless of the enabled state.
+     */
+    public static void reloadShaders() {
+        IrisPipeline.instance().destroy();
+        if (isEnabled()) {
+            reloadRenderer();
+        }
+        SodiumClientMod.logger().info("[Iris] shaders reloaded from disk (pack '" + activePack() + "')");
+    }
+
     /** Selects the active shader pack, rebuilding the pipeline + renderer. A no-op if the name is null or unchanged. */
     public static void setPack(String name) {
         if (name == null || name.equals(IrisPipeline.instance().activePackName())) {

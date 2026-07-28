@@ -1,0 +1,15 @@
+# Iris標準キーバインド(IrisとおなじキーとデフォルトのK/R/O)。
+iris.keybinds=Iris キー割り当て
+iris.keybind.toggleShaders=シェーダーの切り替え
+iris.keybind.reload=シェーダーのリロード
+iris.keybind.shaderPackSelection=シェーダーパック選択画面
+
+# Iris標準のアクションバー・ステータスメッセージ。
+iris.shaders.toggled=シェーダーを切り替えました！使用中: %s
+iris.shaders.disabled=シェーダーを無効にしました！
+iris.shaders.reloaded=シェーダーをリロードしました！
+
+# Yumelium独自。
+key.yumelium.shaders_cycle_pack=シェーダーパックを巡回
+key.categories.yumelium=Yumelium
+key.yumelium.zoom=ズーム

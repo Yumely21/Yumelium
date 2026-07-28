@@ -1,0 +1,15 @@
+# Iris-standard keybinds (same translation keys + defaults as Iris: K toggle, R reload, O pack screen).
+iris.keybinds=Iris Keybinds
+iris.keybind.toggleShaders=Toggle Shaders
+iris.keybind.reload=Reload Shaders
+iris.keybind.shaderPackSelection=Shaderpack Selection Screen
+
+# Iris-standard action-bar status messages.
+iris.shaders.toggled=Shaders Toggled! Now using %s
+iris.shaders.disabled=Shaders Disabled!
+iris.shaders.reloaded=Shaders Reloaded!
+
+# Yumelium extras.
+key.yumelium.shaders_cycle_pack=Cycle Shader Pack
+key.categories.yumelium=Yumelium
+key.yumelium.zoom=Zoom
