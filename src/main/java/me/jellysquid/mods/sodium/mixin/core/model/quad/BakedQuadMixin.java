@@ -46,9 +46,21 @@ public abstract class BakedQuadMixin implements BakedQuadView {
     @Final
     protected boolean applyDiffuseLighting;
 
-    // 1.12.2 BakedQuad already exposes getSprite(); shadow it to satisfy ModelQuadView#getSprite without overwriting.
-    @Shadow
-    public abstract TextureAtlasSprite getSprite();
+    // getSprite is provided below from a @Unique capture of the constructor's sprite argument instead of shadowing
+    // or overwriting the class's own method — because the method may not EXIST at mixin-apply time. Production
+    // (Cleanroom 0.6.7 + FermiumASM squashBakedQuads, 2026-07-28) reaches mixin apply with BakedQuad stripped of
+    // getSprite (proven: @Overwrite failed "not located in the target class"; the earlier AbstractMethodError at
+    // BakedQuad.getSprite was this same absence surfacing through the unimplemented interface method). FermiumASM
+    // could not be disabled from our side: its transformer lives in a second classloader copy where our reflective
+    // flip and the sodium-port marker probe are both invisible (measured: our flip logged `was false` yet the queue
+    // line still printed). A PLAIN (unannotated) mixin method is the one shape that works in every environment:
+    // target has getSprite (dev, classic loaders) → implicit overwrite; target lacks it (squashed prod) → added.
+    @Unique
+    private TextureAtlasSprite embeddium$sprite;
+
+    public TextureAtlasSprite getSprite() {
+        return this.embeddium$sprite;
+    }
 
     // Per-format int offsets, resolved once from the quad's VertexFormat at construction. -1 means the element is absent.
     @Unique
@@ -77,6 +89,7 @@ public abstract class BakedQuadMixin implements BakedQuadView {
     )
     private void embeddium$init(int[] vertexData, int tintIndex, EnumFacing face, TextureAtlasSprite sprite,
                                 boolean applyDiffuseLighting, VertexFormat format, CallbackInfo ci) {
+        this.embeddium$sprite = sprite;
         // VertexFormat offsets are in bytes; every element in these formats is 4-byte aligned, so /4 gives the int index.
         this.embeddium$stride = format.getIntegerSize();
         this.embeddium$colorOffset = format.hasColor() ? format.getColorOffset() / 4 : -1;

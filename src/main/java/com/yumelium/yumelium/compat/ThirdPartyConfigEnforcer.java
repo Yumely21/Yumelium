@@ -44,6 +44,12 @@ public final class ThirdPartyConfigEnforcer {
             {"B:disablePackageManifestMap", "false"},
             {"B:weakClassCache", "false"},
             {"B:weakResourceCache", "false"},
+            // squashBakedQuads rewrites BakedQuad into an abstract base + generated subclasses; any quad that dodges
+            // its constructor redirection then throws AbstractMethodError from getSprite() inside our mesher (seen in
+            // production 2026-07-28, first chunk build). FermiumASM itself force-disables this when it detects a
+            // Sodium port — our SodiumMixinTweaker marker class makes that guard fire — but the file rule covers any
+            // launch where the marker probe runs before our jar is on the classpath.
+            {"B:squashBakedQuads", "false"},
     };
 
     /** Field names on mirror.normalasm.config.NormalConfig mirrored by the in-memory best-effort flip. */
@@ -51,7 +57,7 @@ public final class ThirdPartyConfigEnforcer {
             "packageStringCanonicalization", "asmDataStringCanonicalization",
             "filePermissionsCacheCanonicalization", "cleanupLaunchClassLoaderLate",
             "cleanupLaunchClassLoaderEarly", "disablePackageManifestMap",
-            "weakClassCache", "weakResourceCache",
+            "weakClassCache", "weakResourceCache", "squashBakedQuads",
     };
 
     private ThirdPartyConfigEnforcer() {
@@ -63,6 +69,7 @@ public final class ThirdPartyConfigEnforcer {
         enforceFile(new File(config, "vintagefix.properties"), VINTAGEFIX_RULES, "=");
         enforceFile(new File(config, "normalasm.cfg"), NORMALASM_RULES, "=");
         flipNormalAsmInMemory();
+        forceNormalTransformerSquashOff();
     }
 
     private static void enforceFile(File file, String[][] rules, String sep) {
@@ -116,6 +123,33 @@ public final class ThirdPartyConfigEnforcer {
             }
         } catch (Throwable absent) {
             // FermiumASM not installed / config class not loadable yet — file rules cover it
+        }
+    }
+
+    /**
+     * The decisive same-launch switch for the BakedQuad squasher (production crash 2026-07-28, Cleanroom 0.6.7):
+     * {@code NormalTransformer}'s CONSTRUCTOR builds the transformation queue from its {@code squashBakedQuads}
+     * STATIC (copied from NormalConfig at class-init), and the mixin-enqueue gate reads the same static. In that
+     * launch the field was true even though normalasm.cfg said false (the fork's config read diverges from the file
+     * on 0.6.7 — mechanism unproven), and the "sodium port installed" auto-guard did not fire either. Timing proven
+     * from the crash log: our coremod's injectData ("Calling tweak Yumelium", :49) runs BEFORE the transformer is
+     * instantiated ("preparing to bytecode manipulate", :50) — so forcing the static false here prevents BakedQuad
+     * from ever entering the queue. Class.forName triggering their {@code <clinit>} is fine: it only copies the
+     * config boolean, which we then overwrite.
+     */
+    private static void forceNormalTransformerSquashOff() {
+        try {
+            Class<?> t = Class.forName("mirror.normalasm.core.NormalTransformer");
+            java.lang.reflect.Field f = t.getField("squashBakedQuads");
+            boolean was = f.getBoolean(null);
+            f.setBoolean(null, false);
+            log("NormalTransformer.squashBakedQuads was " + was + " -> forced false (before transformer instantiation)");
+        } catch (ClassNotFoundException absent) {
+            // FermiumASM not installed — nothing to do
+        } catch (Throwable t) {
+            // Fork renamed the field, or a future loader blocks the reflective write — BakedQuadMixin's own
+            // getSprite implementation still keeps the mesher alive if the squasher runs.
+            log("NormalTransformer squash pre-flip unavailable: " + t);
         }
     }
 
