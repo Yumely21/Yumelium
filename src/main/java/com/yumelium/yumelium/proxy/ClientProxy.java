@@ -75,5 +75,12 @@ public class ClientProxy implements IProxy {
         // Custom FANCY cloud renderer (replaces vanilla via the provider's IRenderHandler): exposed-face + back-face
         // culled + static-VBO clouds — removes vanilla's diagonal/grid seams and rebuilds nothing per frame.
         MinecraftForge.EVENT_BUS.register(new com.yumelium.yumelium.client.cloud.CloudRendererRegistrar());
+
+        // The Betweenlands: its FBO WorldShader blits over our composite output in its dimension — a per-tick
+        // reflection handle yields it while our shaders are ON and restores the user's setting when they go OFF.
+        // (Must NOT be a mixin: early configs probing mod classes poison Foundation's classloader — see the class doc.)
+        if (net.minecraftforge.fml.common.Loader.isModLoaded("thebetweenlands")) {
+            MinecraftForge.EVENT_BUS.register(new com.yumelium.yumelium.compat.BetweenlandsCompat());
+        }
     }
 }

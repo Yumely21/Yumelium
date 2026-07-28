@@ -142,8 +142,23 @@ public class FluidRenderer {
         this.currentBlockId = idMapper == null ? 0 : idMapper.idFor(fluidState);
 
         // Vanilla water uses the desaturate material so its blue texture becomes grayscale in the shader and the biome
-        // tint yields the real per-biome colour (1.13 style). Lava/modded fluids keep their own texture + render layer.
-        boolean isWater = fluidState.getBlock() == Blocks.WATER || fluidState.getBlock() == Blocks.FLOWING_WATER;
+        // tint yields the real per-biome colour (1.13 style). MODDED water is routed the same way (2026-07-28,
+        // Betweenlands phase): a fluid whose block material is WATER and whose registered fluid name is water-like
+        // ("swamp_water", "stagnant_water", ...) gets the pack's full water treatment — translucent water pass, waves,
+        // reflections — instead of flat textured SOLID geometry. The name check keeps thick water-material liquids a
+        // mod deliberately styles otherwise (Betweenlands tar/rubber) on their own texture + layer: desaturation would
+        // grey them out, and tar shouldn't ripple. Their block tint (e.g. the swamp murk gradient) still applies via
+        // the colorProvider below, so this doesn't bleach modded water to vanilla blue.
+        boolean isWater = fluidState.getBlock() == Blocks.WATER || fluidState.getBlock() == Blocks.FLOWING_WATER
+                || (com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().isEnabled()
+                        && fluidState.getMaterial() == net.minecraft.block.material.Material.WATER
+                        && fluid.getName() != null
+                        && fluid.getName().toLowerCase(java.util.Locale.ROOT).contains("water"));
+        if (isWater && this.currentBlockId == 0 && idMapper != null) {
+            // No block.properties entry of its own (packs don't know modded fluids) — inherit vanilla water's id so
+            // the shader's water branch (mc_Entity 32000) recognises it.
+            this.currentBlockId = idMapper.idFor(Blocks.WATER.getDefaultState());
+        }
         Material material = isWater ? DefaultMaterials.WATER : DefaultMaterials.forRenderLayer(fluidState.getBlock().getRenderLayer());
         ChunkModelBuilder meshBuilder = buffers.get(material);
 

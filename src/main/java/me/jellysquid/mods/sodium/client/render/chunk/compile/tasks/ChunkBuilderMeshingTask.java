@@ -108,6 +108,17 @@ public class ChunkBuilderMeshingTask extends ChunkBuilderTask<ChunkBuildOutput> 
                         blockPos.setPos(x, y, z);
                         modelOffset.setPos(x & 15, y & 15, z & 15);
 
+                        // Forge fluid blocks must have exactly ONE renderer per mode, or the two surfaces z-fight —
+                        // and the winner varies per section, which reads as "water cut off at chunk boundaries".
+                        // Shaders ON: our FluidRenderer owns every fluid surface (shader water attributes); the pure
+                        // fluid model (ModelFluid) is skipped below, while fluid-EMBEDDING blocks (Betweenlands
+                        // underwater plants: real model + water in the same cell) keep their model and get their
+                        // water from FluidRenderer. Shaders OFF: the mod renders itself exactly as it would without
+                        // us — models own everything and FluidRenderer skips ALL IFluidBlock blocks (drawing an
+                        // embedded-fluid cell here put an opaque murk-tinted cube over plant cells). Vanilla
+                        // BlockLiquid is not an IFluidBlock, so vanilla water always uses FluidRenderer.
+                        boolean shadersOn = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().isEnabled();
+
                         if (blockState.getRenderType() == EnumBlockRenderType.MODEL) {
                             // 1.12.2: connection/variant state (panes, fences, walls, stairs, redstone, doors, ...) lives
                             // in getActualState, and the model is chosen from it — like vanilla BlockRendererDispatcher.
@@ -120,9 +131,24 @@ public class ChunkBuilderMeshingTask extends ChunkBuilderTask<ChunkBuildOutput> 
                             } catch (Throwable t) {
                                 actualState = blockState;
                                 renderState = blockState;
+                                // The fallback hides whatever getActualState/getExtendedState needed to provide
+                                // (connection variants, Forge extended data like fluid corner heights) — surface it
+                                // once per block class instead of failing silently (lesson from the BTL water hunt).
+                                if (EXT_STATE_FAILED.add(blockState.getBlock().getClass().getName())) {
+                                    me.jellysquid.mods.sodium.client.SodiumClientMod.logger().warn(
+                                            "getActualState/getExtendedState failed for "
+                                                    + blockState.getBlock().getClass().getName()
+                                                    + " — rendering with the plain state", t);
+                                }
                             }
 
                             IBakedModel model = cache.getBlockModels().getModelForState(actualState);
+
+                            // Blocks that merely EMBED a fluid (real model) never match — only the pure fluid model
+                            // is skipped, and only while our FluidRenderer draws that surface instead (shaders ON).
+                            // Toggling shaders rebuilds the renderer, so meshes always match the current ownership.
+                            boolean forgeFluidModel = shadersOn && model != null
+                                    && model.getClass().getName().startsWith("net.minecraftforge.client.model.ModelFluid$");
 
                             long seed = MathHelper.getPositionRandom(blockPos);
 
@@ -135,9 +161,9 @@ public class ChunkBuilderMeshingTask extends ChunkBuilderTask<ChunkBuildOutput> 
                             BlockRenderLayer forcedLayer =
                                     layerOverrides == null ? null : layerOverrides.get(blockState.getBlock());
                             for (BlockRenderLayer layer : BlockRenderLayer.values()) {
-                                boolean draw = forcedLayer != null
+                                boolean draw = !forgeFluidModel && (forcedLayer != null
                                         ? layer == forcedLayer
-                                        : blockState.getBlock().canRenderInLayer(blockState, layer);
+                                        : blockState.getBlock().canRenderInLayer(blockState, layer));
                                 if (draw) {
                                     context.update(blockPos, modelOffset, renderState, model, seed, layer);
                                     cache.getBlockRenderer().renderModel(context, buffers);
@@ -145,8 +171,12 @@ public class ChunkBuilderMeshingTask extends ChunkBuilderTask<ChunkBuildOutput> 
                             }
                         }
 
-                        // 1.12.2 fluids are blocks; render liquid geometry from the fluid block state.
-                        if (blockState.getMaterial().isLiquid()) {
+                        // 1.12.2 fluids are blocks; render liquid geometry from the fluid block state. With shaders
+                        // OFF, Forge fluid blocks (IFluidBlock — pure fluids AND fluid-embedding blocks) are entirely
+                        // the mod's own models' responsibility (see the ownership note above).
+                        boolean fluidRan = blockState.getMaterial().isLiquid()
+                                && (shadersOn || !(blockState.getBlock() instanceof net.minecraftforge.fluids.IFluidBlock));
+                        if (fluidRan) {
                             cache.getFluidRenderer().render(slice, blockState, blockPos, modelOffset, buffers);
                         }
 
@@ -209,6 +239,9 @@ public class ChunkBuilderMeshingTask extends ChunkBuilderTask<ChunkBuildOutput> 
 
         return new ChunkBuildOutput(this.render, renderData.build(), meshes, this.buildTime);
     }
+
+    /** Once-per-block-class marker for the getActualState/getExtendedState failure warning above. */
+    private static final java.util.Set<String> EXT_STATE_FAILED = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private ReportedException fillCrashInfo(CrashReport report, WorldSlice slice, BlockPos pos) {
         CrashReportCategory crashReportSection = report.makeCategory("Block being rendered");
