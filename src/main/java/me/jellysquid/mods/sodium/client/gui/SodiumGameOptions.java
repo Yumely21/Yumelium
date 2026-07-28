@@ -146,7 +146,10 @@ public class SodiumGameOptions {
         MB_512(new TextComponentTranslation("yumelium.options.nvidium_buffer_size.512mb"), 512L * 1024 * 1024),
         GB_1(new TextComponentTranslation("yumelium.options.nvidium_buffer_size.1gb"), 1024L * 1024 * 1024),
         GB_2(new TextComponentTranslation("yumelium.options.nvidium_buffer_size.2gb"), 2048L * 1024 * 1024),
-        GB_4(new TextComponentTranslation("yumelium.options.nvidium_buffer_size.4gb"), 4096L * 1024 * 1024);
+        GB_4(new TextComponentTranslation("yumelium.options.nvidium_buffer_size.4gb"), 4096L * 1024 * 1024),
+        // "Unlimited" = capped at the GPU's own dedicated VRAM, queried from the driver at first use (needs a live
+        // GL context, so it cannot be a fixed constant here). Sections then never drop for budget reasons alone.
+        UNLIMITED(new TextComponentTranslation("yumelium.options.nvidium_buffer_size.unlimited"), -1L);
 
         private final ITextComponent name;
         private final long bytes;
@@ -157,7 +160,9 @@ public class SodiumGameOptions {
         }
 
         public long bytes() {
-            return this.bytes;
+            return this.bytes < 0
+                    ? com.yumelium.yumelium.nvidium.NvidiumBackend.dedicatedVramBytes()
+                    : this.bytes;
         }
 
         @Override
@@ -244,7 +249,12 @@ public class SodiumGameOptions {
         public boolean allowDirectMemoryAccess = true;
         public boolean useAdvancedStagingBuffers = true;
         public boolean ignoreDriverBlacklist = false;
-        public boolean translucencySorting = false;
+        // Default ON = vanilla parity (1.12.2 re-sorts translucency as the camera moves). OFF renders translucent
+        // quads in mesh-build order, which collapses whenever several translucent surfaces share a section — barely
+        // visible in the overworld's single flat water sheet, but The Betweenlands (stacked water levels + plants
+        // that embed fluid quads in the same cell) made water behind plants vanish entirely (2026-07-28). This flag
+        // also feeds the per-quad sort data Nvidium's FULL translucent mode consumes.
+        public boolean translucencySorting = true;
         public boolean disableIncompatibleModWarnings = false;
     }
 

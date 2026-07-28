@@ -64,6 +64,11 @@ public final class NvidiumBackend {
     private long stagingCursor;
     private long geometryBytes;      // current allocated geometry size (grows on demand)
     private long maxGeometryBytes;   // configured cap (Yumelium Plus → Nvidium buffer size)
+    // Work-item / sort tables also grow on demand (kept across reset() so a dimension change doesn't re-grow).
+    // The old FIXED sizes silently truncated the translucent pass — emitted last — once the visible set got big
+    // enough: in the flat, open Betweenlands swamp all water/glass flickered out per-frame (2026-07-28).
+    private long metadataBytes = METADATA_BYTES;
+    private long sortIndexBytes = SORT_INDEX_BYTES;
 
     // key -> {arenaOffset, totalSize, ox, oy, oz, solidQuads, cutoutQuads, translucentQuads}
     private final Long2ObjectLinkedOpenHashMap<int[]> sections = new Long2ObjectLinkedOpenHashMap<>();
@@ -142,12 +147,12 @@ public final class NvidiumBackend {
         this.maxGeometryBytes = configuredMaxGeometryBytes();
         this.geometryBytes = Math.min(INITIAL_GEOMETRY_BYTES, this.maxGeometryBytes);
         this.geometry = new AddressableDeviceBuffer(this.geometryBytes);
-        this.metadata = new AddressableDeviceBuffer(METADATA_BYTES);
+        this.metadata = new AddressableDeviceBuffer(this.metadataBytes);
         this.arena = new BufferArena(this.geometryBytes);
         this.staging = new PersistentMappedBuffer(STAGING_BYTES);
-        this.metaStaging = new PersistentMappedBuffer(METADATA_BYTES);
-        this.sortIndexBuffer = new AddressableDeviceBuffer(SORT_INDEX_BYTES);
-        this.sortStaging = new PersistentMappedBuffer(SORT_INDEX_BYTES);
+        this.metaStaging = new PersistentMappedBuffer(this.metadataBytes);
+        this.sortIndexBuffer = new AddressableDeviceBuffer(this.sortIndexBytes);
+        this.sortStaging = new PersistentMappedBuffer(this.sortIndexBytes);
         this.initialized = true;
         log("initialized: geometry=" + (this.geometryBytes >> 20) + "MB (max " + (this.maxGeometryBytes >> 20)
                 + "MB) gpuAddress=0x" + Long.toHexString(this.geometry.gpuAddress()) + " metadata gpuAddress=0x"
@@ -160,6 +165,33 @@ public final class NvidiumBackend {
         } catch (Throwable t) {
             return DEFAULT_GEOMETRY_BYTES;
         }
+    }
+
+    /** GL_NVX_gpu_memory_info total-dedicated-VRAM constant (value is reported in KiB). */
+    private static final int GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX = 0x9047;
+    private static long cachedDedicatedVramBytes;
+
+    /**
+     * The GPU's total dedicated VRAM, queried once from the driver — the cap behind the "Unlimited" buffer-size
+     * option, so the arena may grow to the physical memory but never past it. Needs a live GL context (only called
+     * from backend init on the render thread). Nvidium requires NVIDIA, where the NVX extension is always present;
+     * the 4 GB fallback covers a hypothetical driver that hides it.
+     */
+    public static long dedicatedVramBytes() {
+        if (cachedDedicatedVramBytes == 0) {
+            long bytes = 0;
+            try {
+                if (org.lwjgl.opengl.GL.getCapabilities().GL_NVX_gpu_memory_info) {
+                    bytes = (long) org.lwjgl.opengl.GL11C.glGetInteger(GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX) * 1024L;
+                }
+            } catch (Throwable ignored) {
+                // no context yet / exotic driver — fall through to the default below
+            }
+            cachedDedicatedVramBytes = bytes > 0 ? bytes : 4096L * 1024 * 1024;
+            log("dedicated VRAM = " + (cachedDedicatedVramBytes >> 20) + "MB"
+                    + (bytes > 0 ? " (NVX query)" : " (query unavailable — assuming 4GB)"));
+        }
+        return cachedDedicatedVramBytes;
     }
 
     /** @return true if translucent sections should be ordered back-to-front (sort mode SECTION or FULL, not OFF). */
@@ -434,13 +466,32 @@ public final class NvidiumBackend {
         this.lastSortSections = sortSections;
         this.lastFullSort = fullSort;
 
-        long slotBytes = METADATA_BYTES / 3;
+        // Collect this frame's visible resident sections once (Sodium already frustum+occlusion culled them).
+        int vis = collectVisibleSections(lists);
+
+        // Demand-size the tables BEFORE emitting: translucent is emitted last, so an overflow silently truncates
+        // exactly the translucent pass. Growth is a rare one-off per world/dimension scale-up.
+        long requiredItems = 0;
+        long requiredSortInts = 0;
+        for (int i = 0; i < vis; i++) {
+            int[] s = this.visibleScratch[i];
+            for (int pass = PASS_SOLID; pass <= PASS_TRANSLUCENT; pass++) {
+                int quads = s[5 + pass];
+                if (quads != 0) {
+                    requiredItems += (quads + QUADS_PER_WG - 1) / QUADS_PER_WG;
+                }
+            }
+            requiredSortInts += s[5 + PASS_TRANSLUCENT];
+        }
+        ensureMetadataCapacity(requiredItems);
+        if (fullSort) {
+            ensureSortIndexCapacity(requiredSortInts);
+        }
+
+        long slotBytes = this.metadataBytes / 3;
         long base = this.metaStaging.address() + (long) this.stagingSlot * slotBytes;
         int maxItems = (int) (slotBytes / META_BYTES);
         int item = 0;
-
-        // Collect this frame's visible resident sections once (Sodium already frustum+occlusion culled them).
-        int vis = collectVisibleSections(lists);
 
         // Solid then cutout: opaque, order-independent.
         for (int pass = PASS_SOLID; pass <= PASS_CUTOUT; pass++) {
@@ -483,7 +534,7 @@ public final class NvidiumBackend {
 
         this.sortActive = false;
         if (fullSort) {
-            long sortSlotBytes = SORT_INDEX_BYTES / 3;
+            long sortSlotBytes = this.sortIndexBytes / 3;
             long sortBase = this.sortStaging.address() + (long) this.sortStagingSlot * sortSlotBytes;
             int maxSortInts = (int) (sortSlotBytes / 4);
             int sortCount = 0;
@@ -526,6 +577,51 @@ public final class NvidiumBackend {
                     + item + " (solid=" + this.passItemCount[PASS_SOLID] + " cutout=" + this.passItemCount[PASS_CUTOUT]
                     + " translucent=" + this.passItemCount[PASS_TRANSLUCENT] + ")");
         }
+    }
+
+    /**
+     * Grows the triple-buffered work-item table when the visible set needs more items than a slot holds.
+     * glFinish first: queued prior frames still dereference the OLD table by raw GPU address (bindless), so the
+     * delete must not happen while they are in flight. The hitch is acceptable — growth is a rare one-off.
+     */
+    private void ensureMetadataCapacity(long items) {
+        long needed = items * META_BYTES * 3L;
+        if (needed <= this.metadataBytes) {
+            return;
+        }
+        long newBytes = this.metadataBytes;
+        while (newBytes < needed) {
+            newBytes <<= 1;
+        }
+        org.lwjgl.opengl.GL11C.glFinish();
+        this.metadata.delete();
+        this.metaStaging.delete();
+        this.metadataBytes = newBytes;
+        this.metadata = new AddressableDeviceBuffer(newBytes);
+        this.metaStaging = new PersistentMappedBuffer(newBytes);
+        this.stagingSlot = 0;
+        log("work-item table grown to " + (newBytes >> 20) + "MB ("
+                + ((newBytes / 3) / META_BYTES) + " items/frame)");
+    }
+
+    /** Same on-demand growth for the FULL-sort per-quad index table (one int per visible translucent quad). */
+    private void ensureSortIndexCapacity(long ints) {
+        long needed = ints * 4L * 3L;
+        if (needed <= this.sortIndexBytes) {
+            return;
+        }
+        long newBytes = this.sortIndexBytes;
+        while (newBytes < needed) {
+            newBytes <<= 1;
+        }
+        org.lwjgl.opengl.GL11C.glFinish();
+        this.sortIndexBuffer.delete();
+        this.sortStaging.delete();
+        this.sortIndexBytes = newBytes;
+        this.sortIndexBuffer = new AddressableDeviceBuffer(newBytes);
+        this.sortStaging = new PersistentMappedBuffer(newBytes);
+        this.sortStagingSlot = 0;
+        log("translucent sort table grown to " + (newBytes >> 20) + "MB");
     }
 
     /** Gather the resident sections in Sodium's visible render list into {@link #visibleScratch}; returns the count. */
