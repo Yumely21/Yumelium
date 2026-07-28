@@ -34,6 +34,14 @@ public abstract class BakedQuadMixin implements BakedQuadView {
     @Final
     protected int[] vertexData;
 
+    // ALL vertex reads must go through this METHOD, never the field above: Forge's UnpackedBakedQuad ("pipeline"
+    // quads — e.g. the fluid submodels inside The Betweenlands' ModelCombined) packs its float data into the int[]
+    // LAZILY inside getVertexData(). Reading the raw field on a never-packed quad returns zeros → degenerate
+    // zero-area geometry that silently renders nothing (2026-07-29: invisible water surfaces at every BTL
+    // plant-with-embedded-fluid cell). Plain BakedQuads just return the field, so this costs nothing there.
+    @Shadow
+    public abstract int[] getVertexData();
+
     @Shadow
     @Final
     protected int tintIndex;
@@ -106,48 +114,48 @@ public abstract class BakedQuadMixin implements BakedQuadView {
     @Override
     public float getX(int idx) {
         // Position is always the first element (byte/int offset 0) in these formats.
-        return Float.intBitsToFloat(this.vertexData[embeddium$base(idx)]);
+        return Float.intBitsToFloat(this.getVertexData()[embeddium$base(idx)]);
     }
 
     @Override
     public float getY(int idx) {
-        return Float.intBitsToFloat(this.vertexData[embeddium$base(idx) + 1]);
+        return Float.intBitsToFloat(this.getVertexData()[embeddium$base(idx) + 1]);
     }
 
     @Override
     public float getZ(int idx) {
-        return Float.intBitsToFloat(this.vertexData[embeddium$base(idx) + 2]);
+        return Float.intBitsToFloat(this.getVertexData()[embeddium$base(idx) + 2]);
     }
 
     @Override
     public int getColor(int idx) {
         int offset = this.embeddium$colorOffset;
-        return offset == -1 ? 0xFFFFFFFF : this.vertexData[embeddium$base(idx) + offset];
+        return offset == -1 ? 0xFFFFFFFF : this.getVertexData()[embeddium$base(idx) + offset];
     }
 
     @Override
     public float getTexU(int idx) {
         int offset = this.embeddium$texOffset;
-        return offset == -1 ? 0.0F : Float.intBitsToFloat(this.vertexData[embeddium$base(idx) + offset]);
+        return offset == -1 ? 0.0F : Float.intBitsToFloat(this.getVertexData()[embeddium$base(idx) + offset]);
     }
 
     @Override
     public float getTexV(int idx) {
         int offset = this.embeddium$texOffset;
-        return offset == -1 ? 0.0F : Float.intBitsToFloat(this.vertexData[embeddium$base(idx) + offset + 1]);
+        return offset == -1 ? 0.0F : Float.intBitsToFloat(this.getVertexData()[embeddium$base(idx) + offset + 1]);
     }
 
     @Override
     public int getLight(int idx) {
         // 1.12.2 block quads (ITEM format) carry no lightmap; 0 tells the light pipeline to use computed lighting.
         int offset = this.embeddium$lightOffset;
-        return offset == -1 ? 0 : this.vertexData[embeddium$base(idx) + offset];
+        return offset == -1 ? 0 : this.getVertexData()[embeddium$base(idx) + offset];
     }
 
     @Override
     public int getForgeNormal(int idx) {
         int offset = this.embeddium$normalOffset;
-        return offset == -1 ? 0 : this.vertexData[embeddium$base(idx) + offset];
+        return offset == -1 ? 0 : this.getVertexData()[embeddium$base(idx) + offset];
     }
 
     @Override
