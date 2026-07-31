@@ -8,8 +8,9 @@ import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 
 /**
  * Registers the built-in connected-texture tile sprites into the block atlas at stitch time (which fires on every
- * resource reload). The tile PNGs are served by the mod's embedded resources, switched Legacy/New by
- * {@link com.yumelium.yumelium.client.resource.YumeliumTexturePack} according to the connected-textures option.
+ * resource reload). The tile PNGs come from the separate Yumelium companion resource pack (a distributed jar must
+ * not carry Minecraft-derived assets); {@link CtmRegistry#registerBuiltins} probes for them and stays inactive
+ * when no loaded pack provides them.
  */
 public class CtmStitchHandler {
 
