@@ -3,7 +3,9 @@ package com.yumelium.yumelium.nvidium;
 import com.yumelium.yumelium.nvidium.gl.MeshRasterProgram;
 import com.yumelium.yumelium.nvidium.gl.NvidiumGl;
 import me.jellysquid.mods.sodium.client.SodiumClientMod;
+import me.jellysquid.mods.sodium.client.gl.compat.FogHelper;
 import me.jellysquid.mods.sodium.client.render.chunk.lists.SortedRenderLists;
+import me.jellysquid.mods.sodium.client.render.chunk.shader.ChunkFogMode;
 import org.joml.Matrix4fc;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL20C;
@@ -26,6 +28,7 @@ public final class NvidiumRasterizer {
     private MeshRasterProgram program;
     private int uProj, uModelView, uCameraBlock, uCameraFrac, uWorkItems, uGeometry, uBlockTex, uLightTex;
     private int uWorkItemBase, uAlphaTest, uTranslucent, uSortIndex, uUseSortIndex;
+    private int uFogMode, uFogColor, uFogStart, uFogEnd, uFogDensity;
     private FloatBuffer matrixBuffer;
     private boolean failed;
 
@@ -60,6 +63,11 @@ public final class NvidiumRasterizer {
             this.uTranslucent = GL20C.glGetUniformLocation(id, "u_Translucent");
             this.uSortIndex = GL20C.glGetUniformLocation(id, "u_SortIndex");
             this.uUseSortIndex = GL20C.glGetUniformLocation(id, "u_UseSortIndex");
+            this.uFogMode = GL20C.glGetUniformLocation(id, "u_FogMode");
+            this.uFogColor = GL20C.glGetUniformLocation(id, "u_FogColor");
+            this.uFogStart = GL20C.glGetUniformLocation(id, "u_FogStart");
+            this.uFogEnd = GL20C.glGetUniformLocation(id, "u_FogEnd");
+            this.uFogDensity = GL20C.glGetUniformLocation(id, "u_FogDensity");
             this.matrixBuffer = MemoryUtil.memAllocFloat(16);
             log("full terrain rasterizer initialized (uBlockTex=" + this.uBlockTex + " uWorkItemBase=" + this.uWorkItemBase + ")");
         } catch (Throwable t) {
@@ -105,6 +113,22 @@ public final class NvidiumRasterizer {
         NVShaderBufferLoad.glUniformui64NV(this.uGeometry, backend.geometryAddress());
         NVShaderBufferLoad.glUniformui64NV(this.uSortIndex, backend.sortIndexAddress());
         GL20C.glUniform1i(this.uUseSortIndex, 0); // opaque passes never use the sort index; translucent may enable it
+
+        // Fixed-function GL fog cannot touch a GLSL-460 mesh-shader program, so Nvidium terrain rendered with ZERO
+        // fog — no atmospheric distance fog, and no underwater/lava EXP fog (the world looked like clear air from
+        // under the water surface, 2026-07-31). Emulate it exactly like Sodium's ChunkShaderFogComponent: read the
+        // current fog state through FogHelper each pass (setupFog ran just before renderBlockLayer, so this honors
+        // both the Yumelium Fog toggle and its water/lava exemption for free) and apply fog.glsl's formulas in the
+        // fragment. GL_EXP is approximated as EXP2, same as the Sodium path.
+        ChunkFogMode fogMode = FogHelper.getFogMode();
+        GL20C.glUniform1i(this.uFogMode, fogMode == ChunkFogMode.EXP2 ? 1 : fogMode == ChunkFogMode.SMOOTH ? 2 : 0);
+        if (fogMode != ChunkFogMode.NONE) {
+            float[] fogColor = FogHelper.getFogColor();
+            GL20C.glUniform4f(this.uFogColor, fogColor[0], fogColor[1], fogColor[2], fogColor[3]);
+            GL20C.glUniform1f(this.uFogStart, FogHelper.getFogStart());
+            GL20C.glUniform1f(this.uFogEnd, FogHelper.getFogEnd());
+            GL20C.glUniform1f(this.uFogDensity, FogHelper.getFogDensity());
+        }
         return true;
     }
 
@@ -200,7 +224,7 @@ public final class NvidiumRasterizer {
             "uniform ivec3 u_CameraBlock;\n" +
             "uniform vec3 u_CameraFrac;\n" +
             "uniform int u_WorkItemBase;\n" +
-            "layout(location = 0) out VertexData { vec4 color; vec2 uv; vec2 lightUV; float desaturate; } v_out[];\n" +
+            "layout(location = 0) out VertexData { vec4 color; vec2 uv; vec2 lightUV; float desaturate; float fragDist; } v_out[];\n" +
             "void main() {\n" +
             "    int wi = (u_WorkItemBase + int(gl_WorkGroupID.x)) * 8;\n" +
             "    int byteOffset = u_WorkItems[wi + 0];\n" +
@@ -234,6 +258,8 @@ public final class NvidiumRasterizer {
             "            v_out[o].uv = uv;\n" +
             "            v_out[o].lightUV = clamp(lc / 256.0, vec2(0.5 / 16.0), vec2(15.5 / 16.0));\n" +
             "            v_out[o].desaturate = desat;\n" +
+            // pos is already camera-relative → spherical frag distance, same as Sodium's getFragDistance(SPHERICAL).
+            "            v_out[o].fragDist = length(pos);\n" +
             "        }\n" +
             "        uint pb = q * 6u;\n" +
             "        uint vb = q * 4u;\n" +
@@ -251,11 +277,16 @@ public final class NvidiumRasterizer {
 
     private static final String FRAG_SRC =
             "#version 460\n" +
-            "layout(location = 0) in VertexData { vec4 color; vec2 uv; vec2 lightUV; float desaturate; } v_in;\n" +
+            "layout(location = 0) in VertexData { vec4 color; vec2 uv; vec2 lightUV; float desaturate; float fragDist; } v_in;\n" +
             "uniform sampler2D u_BlockTex;\n" +
             "uniform sampler2D u_LightTex;\n" +
             "uniform int u_AlphaTest;\n" +
             "uniform int u_Translucent;\n" +
+            "uniform int u_FogMode;\n" + // 0 = none, 1 = EXP2 (water/lava), 2 = LINEAR (atmospheric)
+            "uniform vec4 u_FogColor;\n" +
+            "uniform float u_FogStart;\n" +
+            "uniform float u_FogEnd;\n" +
+            "uniform float u_FogDensity;\n" +
             "out vec4 fragColor;\n" +
             "void main() {\n" +
             "    vec4 tex = texture(u_BlockTex, v_in.uv);\n" +
@@ -269,6 +300,16 @@ public final class NvidiumRasterizer {
             "    }\n" +
             "    vec3 light = texture(u_LightTex, v_in.lightUV).rgb;\n" +
             "    vec3 rgb = tex.rgb * v_in.color.rgb * light * v_in.color.a;\n" +
+            // Fog emulation — formulas copied from assets/sodium/shaders/include/fog.glsl (_exp2Fog / _linearFog),
+            // arg order and all: EXP2 mixes (fog → frag), LINEAR mixes (frag → fog). Fragment alpha stays untouched.
+            "    if (u_FogMode == 1) {\n" +
+            "        float d = v_in.fragDist * u_FogDensity;\n" +
+            "        float f = clamp(1.0 / exp2(d * d), 0.0, 1.0);\n" +
+            "        rgb = mix(u_FogColor.rgb, rgb, f * u_FogColor.a);\n" +
+            "    } else if (u_FogMode == 2 && v_in.fragDist > u_FogStart) {\n" +
+            "        float f = v_in.fragDist < u_FogEnd ? smoothstep(u_FogStart, u_FogEnd, v_in.fragDist) : 1.0;\n" +
+            "        rgb = mix(rgb, u_FogColor.rgb, f * u_FogColor.a);\n" +
+            "    }\n" +
             "    float a = (u_Translucent == 1) ? tex.a : 1.0;\n" +
             "    fragColor = vec4(rgb, a);\n" +
             "}\n";
