@@ -7,6 +7,8 @@ import org.lwjgl.opengl.GL11C;
 import org.lwjgl.opengl.GL12C;
 import org.lwjgl.opengl.GL13;
 import org.lwjgl.opengl.GL14C;
+import org.lwjgl.opengl.GL15C;
+import org.lwjgl.opengl.GL21C;
 import org.lwjgl.opengl.GL20C;
 import org.lwjgl.opengl.GL30C;
 import org.lwjgl.opengl.GL31C;
@@ -1005,6 +1007,49 @@ public final class RenderTargets {
         return max;
     }
 
+    // --- centerDepthSmooth async readback (double-buffered pixel-pack buffers, 1-frame latency) --------------------
+    private final int[] centerDepthPbos = new int[2];
+    private final boolean[] centerDepthQueued = new boolean[2];
+    private int centerDepthWriteIdx;
+    private final java.nio.FloatBuffer centerDepthScratch = org.lwjgl.BufferUtils.createFloatBuffer(1);
+
+    /** Centre depth of depthtex0, read back ASYNCHRONOUSLY: queues a GPU→PBO copy of this frame's centre texel and
+     * returns the value queued on the PREVIOUS call (1 frame old — the caller's temporal smoothing makes the latency
+     * unobservable). The synchronous DSA path ({@link #readDepthTexel}) stalls the CPU until the GPU drains the whole
+     * world render — measurable FPS loss when called per frame (2026-07-31, DOF auto-focus) — while this never blocks:
+     * by the time a PBO is read, its transfer finished a frame ago. Returns -1 until the first result lands. */
+    public float readCenterDepthAsync() {
+        if (this.depthTex == 0 || this.width <= 0) {
+            return -1.0F;
+        }
+        if (this.centerDepthPbos[0] == 0) {
+            for (int i = 0; i < 2; i++) {
+                this.centerDepthPbos[i] = GL15C.glGenBuffers();
+                GL15C.glBindBuffer(GL21C.GL_PIXEL_PACK_BUFFER, this.centerDepthPbos[i]);
+                GL15C.glBufferData(GL21C.GL_PIXEL_PACK_BUFFER, 4, GL15C.GL_STREAM_READ);
+                this.centerDepthQueued[i] = false;
+            }
+        }
+        int write = this.centerDepthWriteIdx;
+        int read = write ^ 1;
+        // Queue this frame's centre texel into the write PBO — with a PACK buffer bound the pixels argument is a
+        // byte offset, and the copy runs GL-server-side without a client sync.
+        GL15C.glBindBuffer(GL21C.GL_PIXEL_PACK_BUFFER, this.centerDepthPbos[write]);
+        GL45C.nglGetTextureSubImage(this.depthTex, 0, this.width / 2, this.height / 2, 0, 1, 1, 1,
+                GL11C.GL_DEPTH_COMPONENT, GL11C.GL_FLOAT, 4, 0L);
+        float result = -1.0F;
+        if (this.centerDepthQueued[read]) {
+            GL15C.glBindBuffer(GL21C.GL_PIXEL_PACK_BUFFER, this.centerDepthPbos[read]);
+            this.centerDepthScratch.clear();
+            GL15C.glGetBufferSubData(GL21C.GL_PIXEL_PACK_BUFFER, 0, this.centerDepthScratch);
+            result = this.centerDepthScratch.get(0);
+        }
+        GL15C.glBindBuffer(GL21C.GL_PIXEL_PACK_BUFFER, 0);
+        this.centerDepthQueued[write] = true;
+        this.centerDepthWriteIdx = read;
+        return result;
+    }
+
     /** DIAGNOSTIC: the scene depth (depthtex0) at texel (x, y) — e.g. to check whether the HAND's depth landed there. */
     public float readDepthTexel(int x, int y) {
         if (this.depthTex == 0 || this.width <= 0) {
@@ -1894,6 +1939,14 @@ public final class RenderTargets {
 
     public void destroy() {
         destroyShadow();
+        if (this.centerDepthPbos[0] != 0) {
+            GL15C.glDeleteBuffers(this.centerDepthPbos[0]);
+            GL15C.glDeleteBuffers(this.centerDepthPbos[1]);
+            this.centerDepthPbos[0] = 0;
+            this.centerDepthPbos[1] = 0;
+            this.centerDepthQueued[0] = false;
+            this.centerDepthQueued[1] = false;
+        }
         if (this.defaultSpecularTex != 0) {
             deleteTexture(this.defaultSpecularTex);
             deleteTexture(this.defaultNormalsTex);

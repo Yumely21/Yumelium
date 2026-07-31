@@ -77,6 +77,8 @@ public final class IrisPipeline {
     private final List<Pass> deferredPrograms = new ArrayList<>();
     private final List<Pass> compositePrograms = new ArrayList<>();
     private GlslProgram finalProgram;
+    /** Colortex indices the final program declares {@code colortexNMipmapEnabled = true} for (usually empty). */
+    private int[] finalMipmaps = new int[0];
 
     /** A fullscreen deferred/composite pass: the compiled program + the colortex indices it writes (RENDERTARGETS), in
      * {@code gl_FragData} order. */
@@ -335,7 +337,8 @@ public final class IrisPipeline {
 
     // DIAGNOSTIC (composite chain bisection): run only the first N passes of prepare+deferred+composite, then show
     // colortex0. DIAG_CHAIN_PASSES=0 → raw gbuffer; raise it to find the pass that whites out. DIAG_BLIT_INSTEAD_OF_FINAL
-    // shows colortex0 directly (skips the pack's final tonemap) to separate composite corruption from a final blow-up.
+    // skips the pack's final program and shows front(FINAL_COLORTEX) through the tonemap blit instead — separates
+    // composite corruption from a final blow-up.
     private static final int DIAG_CHAIN_PASSES = 999;
     private static final boolean DIAG_BLIT_INSTEAD_OF_FINAL = false;
 
@@ -350,7 +353,8 @@ public final class IrisPipeline {
     private static final boolean DIAG_COLORED_LIGHTING = false;
 
     /** The colortex the composites leave the finished, tonemapped scene colour in (Complementary's final.glsl reads
-     * colortex3). We blit this to the screen instead of running the pack's off-screen `final` program. */
+     * colortex3). The pack's `final` program is the normal display path; this buffer feeds the tonemap-blit
+     * FALLBACK (pack ships no final, or DIAG_BLIT_INSTEAD_OF_FINAL) and the display-path diagnostics. */
     private static final int FINAL_COLORTEX = 3;
     private GlslProgram tonemapProgram;
 
@@ -421,7 +425,7 @@ public final class IrisPipeline {
     // When true, the display tonemap colour-codes depthtex0 (this.depthTex, the buffer the composite reads as depthtex0)
     // over the near region so we can read the first-person hand's actual z0: RED z0<=0.1 (hand depth landed in depthtex0),
     // YELLOW 0.1..0.56, GREEN 0.56..0.7 (hand depth is the far background → composite treats it as sky/terrain → the
-    // see-through hand). This runs in the ACTUAL display path (unlike the pack's final.glsl, which our pipeline skips).
+    // see-through hand). A DIAG viewer flag: it forces the tonemap quad to draw even when the pack's final ran.
     private static final boolean DIAG_HAND_DEPTH = false;
     // One-shot readback of the WSR face-data SSBO (frame 200) to diagnose the reflection item textures: stale (clear
     // failing) vs real voxelized faces with off-atlas UVs. See CustomImages#diagSsbo.
@@ -627,8 +631,8 @@ public final class IrisPipeline {
             "uniform float diagHandMcbl;\n" +
             "varying vec2 texcoord;\n" +
             "void main() {\n" +
-            // Complementary's final.glsl just samples colortex3 (already tonemapped + colour-graded by the composite
-            // chain) and outputs it; we do the same, skipping only its optional sharpen/vignette/dither post-fx.
+            // The no-final fallback / DIAG viewer: sample the composites' finished colour (bound on unit 0) and output
+            // it unchanged. The pack's own final (sharpen/vignette/dither) is the normal display path.
             "    vec3 c = texture2D(colortex0, texcoord).rgb;\n" +
             "    if (diagHandDepth > 0.5) {\n" +
             // Show the hand's colortex4.a (the reflection fresnel composite1 keys on). For a matte hand it should be ~0
@@ -1108,7 +1112,7 @@ public final class IrisPipeline {
             "cameraPosition", "previousCameraPosition", "sunPosition", "moonPosition", "upPosition", "shadowLightPosition",
             "sunAngle", "shadowAngle", "sunBrightness",
             "worldTime", "worldDay", "moonPhase", "frameCounter", "framemod8", "framemod2", "frameTimeCounter",
-            "frameTime", "frameTimeSmooth",
+            "frameTime", "frameTimeSmooth", "centerDepthSmooth",
             "heldBlockLightValue", "heldBlockLightValue2", "heldItemId", "heldItemId2", "relativeEyePosition",
             "entityId", "entityColor", "blockEntityId", "currentRenderedItemId",
             "rainStrength", "rainFactor", "wetness", "inRainy", "inDry", "inSnowy", "thunderStrength", "thunderFactor",
@@ -2215,6 +2219,29 @@ public final class IrisPipeline {
                 ProgramSource finalSrc = pack.programSet().get("final");
                 if (finalSrc != null && finalSrc.fragment() != null) {
                     this.finalProgram = compileFullscreen(finalSrc, "final");
+                    // final reads the colortex bank exactly like a composite, so honor its colortexNMipmapEnabled
+                    // consts — but its DRAWBUFFERS directive is deliberately NOT parsed: per Iris/OptiFine semantics
+                    // final always renders to MC's framebuffer (Complementary declares DRAWBUFFERS:0 there; routing
+                    // that through the ping-pong chain would clobber colortex0 and display nothing).
+                    if (this.finalProgram != null) {
+                        this.finalMipmaps = parseMipmaps(GlslConditionals.stripInactive(applyOptions(finalSrc.fragment())));
+                    }
+                }
+                // DOF auto-focus gate: sample the centre depth per frame ONLY if some fullscreen program actually
+                // links centerDepthSmooth (GL prunes it when the pack's config compiles the auto-focus branch out).
+                this.wantsCenterDepth = false;
+                java.util.List<Pass> allFullscreen = new java.util.ArrayList<>(this.preparePrograms);
+                allFullscreen.addAll(this.deferredPrograms);
+                allFullscreen.addAll(this.compositePrograms);
+                for (Pass p : allFullscreen) {
+                    if (org.lwjgl.opengl.GL20C.glGetUniformLocation(p.program.handle(), "centerDepthSmooth") >= 0) {
+                        this.wantsCenterDepth = true;
+                        break;
+                    }
+                }
+                if (!this.wantsCenterDepth && this.finalProgram != null && org.lwjgl.opengl.GL20C
+                        .glGetUniformLocation(this.finalProgram.handle(), "centerDepthSmooth") >= 0) {
+                    this.wantsCenterDepth = true;
                 }
                 // Immediate-mode sky programs (fixed-function attrs/matrices, direct compile — no transform).
                 this.skybasicProgram = compileWorldProgram(pack, "gbuffers_skybasic");
@@ -2924,14 +2951,27 @@ public final class IrisPipeline {
     /** {@code vignette = false}: the pack does its own vignette in post — the vanilla screen-edge darkening on top of
      * it double-darkens, so it must be suppressed while shaders are on. */
     private boolean packVignette = true;
-    /** {@code underwaterOverlay = false}: the vanilla first-person water-texture overlay fights the pack's own
-     * underwater look. */
-    private boolean packUnderwaterOverlay = true;
+    /** {@code underwaterOverlay = true}: the vanilla first-person water-texture overlay draws with shaders on ONLY
+     * when a pack explicitly asks for it — absent means hidden, matching OptiFine (PropertyDefaultTrueFalse, explicit
+     * true only) and Iris ({@code orElse(false)}). The old absent→show default let the built-in pack (no directive)
+     * and the pre-init window draw the overlay over the pack's own underwater look (2026-07-31). */
+    private boolean packUnderwaterOverlay = false;
     /** {@code rain.depth = false}: rain streaks must not write scene depth (they would poke holes into the composite's
      * depth-driven fog/DOF). */
     private boolean packRainDepth = true;
     /** {@code clouds = off}: the pack renders its own volumetric clouds — the host's cloud layer must not draw. */
     private boolean packVanillaClouds = true;
+    /** centerDepthSmooth: the RAW (nonlinear) depthtex0 value at screen centre, exponentially smoothed — the DOF
+     * auto-focus uniform. Complementary's composite3 (WORLD_BLUR=2 + WB_DOF_FOCUS=0) compares it DIRECTLY against
+     * raw z1, no linearization (its fixed-focus branch converts blocks→depth-buffer space to match). Unset it read
+     * 0.0 = focus pinned to the near plane → everything except the hand rendered at maximum blur (2026-07-31).
+     * Half-life = {@code centerDepthHalflife} directive in TENTHS of a second (OptiFine/Iris default 1.0 = 0.1 s).
+     * Starts at 1.0 (far plane) so the first frames blur-in from "focused at infinity", not from a blurred mess. */
+    private float centerDepthSmooth = 1.0F;
+    private float centerDepthHalflife = 1.0F;
+    /** Whether any fullscreen pass links centerDepthSmooth — the per-frame 1-texel depth readback costs a GPU sync,
+     * so packs without auto-focus DOF must not pay it. Computed at pipeline init. */
+    private boolean wantsCenterDepth;
     /** {@code shadowPlayer = true}: the PLAYER (+ vehicle) still casts a shadow even though the pack turns entity
      * shadow casters off (shadowEntities = false). See {@link #shadowPlayerEnabled}. */
     private boolean packShadowPlayer;
@@ -2974,9 +3014,14 @@ public final class IrisPipeline {
     private void parseMiscDirectives(ShaderPack pack) {
         java.util.Map<String, String> props = resolvedProperties(pack);
         this.packVignette = !"false".equalsIgnoreCase(props.getOrDefault("vignette", "true").trim());
-        this.packUnderwaterOverlay = !"false".equalsIgnoreCase(props.getOrDefault("underwaterOverlay", "true").trim());
+        this.packUnderwaterOverlay = "true".equalsIgnoreCase(props.getOrDefault("underwaterOverlay", "false").trim());
         this.packRainDepth = !"false".equalsIgnoreCase(props.getOrDefault("rain.depth", "true").trim());
         this.packVanillaClouds = !"off".equalsIgnoreCase(props.getOrDefault("clouds", "on").trim());
+        try {
+            this.centerDepthHalflife = Float.parseFloat(props.getOrDefault("centerDepthHalflife", "1.0").trim());
+        } catch (NumberFormatException e) {
+            this.centerDepthHalflife = 1.0F;
+        }
         this.packShadowPlayer = "true".equalsIgnoreCase(props.getOrDefault("shadowPlayer", "false").trim());
         this.packShadowEntities = !"false".equalsIgnoreCase(props.getOrDefault("shadowEntities", "true").trim());
         this.packShadowBlockEntities = !"false".equalsIgnoreCase(props.getOrDefault("shadowBlockEntities", "true").trim());
@@ -5678,6 +5723,19 @@ public final class IrisPipeline {
             // makes z0 (full, water surface) != z1 (opaque, sea floor) at water pixels → the pack's getWSR fires.
             runOpaqueDepthCopy();
 
+            // DOF auto-focus (centerDepthSmooth): centre depth read back ASYNC (double-buffered PBO — the value is
+            // one frame old, which the exponential smoothing swallows; the previous synchronous readDepthTexel here
+            // drained the whole GPU pipeline every frame and measurably cost FPS). Smoothed per the
+            // centerDepthHalflife directive (tenths of a second). See the field note.
+            if (this.wantsCenterDepth) {
+                float rawCenterDepth = this.targets.readCenterDepthAsync();
+                if (rawCenterDepth >= 0.0F) {
+                    float halfLifeSec = Math.max(this.centerDepthHalflife, 0.01F) * 0.1F;
+                    float alpha = 1.0F - (float) Math.exp(-this.frameTime * 0.6931472F / halfLifeSec);
+                    this.centerDepthSmooth += (rawCenterDepth - this.centerDepthSmooth) * alpha;
+                }
+            }
+
             // DIAGNOSTIC: skip the pack's deferred/composite/final chain and blit the RAW colortex0 (the gbuffer the
             // pack's gbuffers_terrain/sky/etc. just wrote) straight to the screen — to isolate whether a "white/broken"
             // result comes from the gbuffer capture or from the composite chain. Set false for normal rendering.
@@ -5720,8 +5778,8 @@ public final class IrisPipeline {
             }
 
             // DIAGNOSTIC: run only the first DIAG_CHAIN_PASSES of the combined prepare+deferred+composite chain, to bisect
-            // which pass whites out the image. When DIAG_BLIT_INSTEAD_OF_FINAL, blit colortex0 straight to the screen
-            // instead of running the pack's final (isolates composite corruption from a final/tonemap blow-up).
+            // which pass whites out the image. Pair with DIAG_BLIT_INSTEAD_OF_FINAL: with the pack's final running, a
+            // truncated chain would still be repainted by final — the blit shows front(FINAL_COLORTEX) untouched.
             List<Pass> chain = new ArrayList<>();
             chain.addAll(this.preparePrograms);
             chain.addAll(this.deferredPrograms);
@@ -5869,6 +5927,37 @@ public final class IrisPipeline {
             // rendering — which is exactly what it did.
             this.targets.endBlendOverrides();
 
+            // Run the pack's `final` program to MC's framebuffer — the pack's last post-fx (Complementary: sharpen,
+            // vignette, dither, underwater wobble). It must run HERE, BEFORE the compare-mode/unbind restores below
+            // (setCompositeSamplers re-applies final's own shadowtex0 compare choice; the restores then run after, in
+            // their proven order). bindCompositeReadTextures MUST be re-run first: runPass binds the fronts BEFORE its
+            // draw and flips AFTER without rebinding, so the last pass's freshly written buffers (composite7's FXAA'd
+            // colortex3 here) sit in the new front while the unit still holds that pass's stale INPUT — sampling
+            // through the leftover binds displayed the pre-FXAA frame. Iris semantics: output is the main framebuffer,
+            // final's DRAWBUFFERS is ignored, and the ping-pong parity does NOT advance (no flipTargets — flipping an
+            // unwritten target swaps in a stale frame, see writesColorOutput). The tonemap blit below stays as the
+            // no-final fallback and DIAG viewer; its redundant state-reset + framebuffer rebind after this is harmless.
+            boolean ranFinal = false;
+            if (this.finalProgram != null && !DIAG_BLIT_INSTEAD_OF_FINAL) {
+                endFullscreenState();
+                beginFullscreenState();
+                main.bindFramebuffer(true);
+                this.targets.bindCompositeReadTextures();
+                for (int idx : this.finalMipmaps) {
+                    this.targets.enableMipmapRead(idx);
+                }
+                this.finalProgram.use();
+                setSceneUniforms(this.finalProgram);
+                setCompositeSamplers(this.finalProgram);
+                this.customImages.bindTo(this.finalProgram);
+                drawFullscreenQuad();
+                GlslProgram.unuse();
+                for (int idx : this.finalMipmaps) {
+                    this.targets.disableMipmapRead(idx);
+                }
+                ranFinal = true;
+            }
+
             // composite1 flips the shadow map to raw-depth reads (see setCompositeSamplers); put hardware compare back
             // while unit 0 is still OURS (bindCompositeReadTextures left shadowtex0 bound there), so re-binding it costs
             // nothing and cannot desync GlStateManager's cache. Next frame's terrain does shadow2D and needs compare on.
@@ -5883,9 +5972,10 @@ public final class IrisPipeline {
             endFullscreenState();
             beginFullscreenState();
 
-            // Display the composite chain's result: colortex3 (the buffer Complementary's composites write the finished,
-            // already-tonemapped colour into — final.glsl reads it too), tonemapped a touch and shown with the proven
-            // fixed-function unit-0 + shader draw. Skips only the pack's final post-fx (sharpen/vignette).
+            // Fallback/diagnostic display (draw gated when the pack's final ran above): colortex3 (the buffer
+            // Complementary's composites write the finished, already-tonemapped colour into — final.glsl reads it
+            // too), shown with the proven fixed-function unit-0 + shader draw. The DIAG viewer flags force this quad
+            // even after final ran (see diagViewer below); otherwise only the binds execute (harmless, no draw).
             main.bindFramebuffer(true);
             GlStateManager.setActiveTexture(OpenGlHelper.lightmapTexUnit);
             GlStateManager.bindTexture(this.targets.depthTexture());
@@ -5944,7 +6034,14 @@ public final class IrisPipeline {
                 logColortexAvg("UW-ct0(after composites)", 0);
                 logColortexAvg("UW-final(displayed)", FINAL_COLORTEX);
             }
-            if (this.tonemapProgram != null) {
+            // These DIAG viewers display THROUGH the tonemap quad — when one is on, draw it even though final already
+            // ran (the viewer deliberately paints its visualization over the pack's output).
+            boolean diagViewer = DIAG_HAND_DEPTH || DIAG_SHOW_DEPTHTEX1 || DIAG_COLORTEX7
+                    || DIAG_REF_TEMPORAL || DIAG_COLORTEX4A || DIAG_WSR_READ;
+            if (ranFinal && !diagViewer) {
+                // The pack's final already drew the frame — the state resets/restores above still ran; only the
+                // overwriting tonemap draw is skipped (it would paint front(FINAL_COLORTEX) over final's output).
+            } else if (this.tonemapProgram != null) {
                 this.tonemapProgram.use();
                 this.tonemapProgram.setInt("colortex0", 0);
                 this.tonemapProgram.setInt("depthtex0", 1);
@@ -6680,6 +6777,7 @@ public final class IrisPipeline {
         program.setFloat("framemod2", (float) (this.frameCounter % 2));
         program.setFloat("frameTimeCounter", this.frameTimeCounter);
         program.setFloat("frameTime", this.frameTime);
+        program.setFloat("centerDepthSmooth", this.centerDepthSmooth);
         program.setFloat("frameTimeSmooth", this.frameTimeSmooth);
         // Handheld light — see gatherHeldLight. heldBlockLightValue is the held block's own light level (0..15); the pack
         // fades it by distance itself. heldItemId picks the light's colour out of item.properties.
@@ -7094,8 +7192,10 @@ public final class IrisPipeline {
             if (this.shadowCompProgram != null) routed.add("shadowcomp");
             sb.append("-- programs: ").append(routed.size()).append(" routed of ")
                     .append(pack.programSet().count()).append(" the pack provides --\n");
-            sb.append("   final: NOT RUN by design — the display path blits colortex3, skipping the pack's final post-fx"
-                    + " (sharpen/vignette/dither)\n");
+            sb.append(this.finalProgram != null && !DIAG_BLIT_INSTEAD_OF_FINAL
+                    ? "   final: RUN to MC's framebuffer (pack post-fx active: sharpen/vignette/dither)\n"
+                    : "   final: pack ships none (or DIAG_BLIT_INSTEAD_OF_FINAL) — colortex" + FINAL_COLORTEX
+                            + " tonemap-blit fallback\n");
             sb.append("   gbuffers_line: NOT ROUTED by design — its vertex is the modern-Iris line expansion"
                     + " (vaPosition/vaNormal/gl_VertexID); 1.12.2's GL_LINES draws route through gbuffers_basic\n");
             for (java.util.Map.Entry<String, ProgramSource> e : pack.programSet().programs().entrySet()) {
@@ -7239,6 +7339,7 @@ public final class IrisPipeline {
         if (this.finalProgram != null) {
             this.finalProgram.delete();
             this.finalProgram = null;
+            this.finalMipmaps = new int[0];
         }
         if (this.tonemapProgram != null) {
             this.tonemapProgram.delete();
