@@ -144,11 +144,19 @@ public class ChunkBuilderMeshingTask extends ChunkBuilderTask<ChunkBuildOutput> 
 
                             IBakedModel model = cache.getBlockModels().getModelForState(actualState);
 
-                            // Blocks that merely EMBED a fluid (real model) never match — only the pure fluid model
-                            // is skipped, and only while our FluidRenderer draws that surface instead (shaders ON).
-                            // Toggling shaders rebuilds the renderer, so meshes always match the current ownership.
+                            // Only while our FluidRenderer draws the surface instead (shaders ON): skip the pure fluid
+                            // model entirely, and for blocks that EMBED a fluid in a multi-layer model (Betweenlands
+                            // plants: plant on CUTOUT + a nested forge fluid model on TRANSLUCENT) skip just the
+                            // TRANSLUCENT layer — FluidRenderer already draws that same surface with proper neighbor
+                            // culling, while the nested model's version includes wall-adjacent side quads and reaches
+                            // the pack unclassified (glass material) → a reflective "water surface" film on underwater
+                            // walls near vegetation (2026-07-29, surfaced by the lazy-pack fix that made these quads
+                            // real). Toggling shaders rebuilds the renderer, so meshes always match the ownership.
                             boolean forgeFluidModel = shadersOn && model != null
                                     && model.getClass().getName().startsWith("net.minecraftforge.client.model.ModelFluid$");
+                            boolean embeddedFluidTranslucent = shadersOn
+                                    && blockState.getMaterial().isLiquid()
+                                    && blockState.getBlock() instanceof net.minecraftforge.fluids.IFluidBlock;
 
                             long seed = MathHelper.getPositionRandom(blockPos);
 
@@ -161,7 +169,9 @@ public class ChunkBuilderMeshingTask extends ChunkBuilderTask<ChunkBuildOutput> 
                             BlockRenderLayer forcedLayer =
                                     layerOverrides == null ? null : layerOverrides.get(blockState.getBlock());
                             for (BlockRenderLayer layer : BlockRenderLayer.values()) {
-                                boolean draw = !forgeFluidModel && (forcedLayer != null
+                                boolean draw = !forgeFluidModel
+                                        && !(embeddedFluidTranslucent && layer == BlockRenderLayer.TRANSLUCENT)
+                                        && (forcedLayer != null
                                         ? layer == forcedLayer
                                         : blockState.getBlock().canRenderInLayer(blockState, layer));
                                 if (draw) {

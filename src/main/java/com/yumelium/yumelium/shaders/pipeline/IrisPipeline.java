@@ -2107,6 +2107,12 @@ public final class IrisPipeline {
         this.pipelineInit = true;
         this.startNanos = System.nanoTime();
         try (ShaderPack pack = loadActivePack()) {
+            // 2026-07-27 audit (#8): reset pack-derived meshing state UNCONDITIONALLY first — BEFORE the pack null
+            // check. A pack without block.properties used to inherit the PREVIOUS pack's layer.* forcing (glass stuck
+            // in TRANSLUCENT), and a pack that fails to load entirely (pack == null: missing/corrupt zip) leaked both
+            // the stale layer map and the stale block-id table until restart.
+            this.layerOverrides = null;
+            me.jellysquid.mods.sodium.client.render.chunk.compile.pipeline.BlockRenderer.setBlockIdMapper(null);
             if (pack != null) {
                 // Custom pack textures (read while the pack is open): the pack's noise.png + the cloud-water.png water
                 // normal map (bound to gaux4). shaders.properties selects the water/cloud texture by CLOUD_TEXTURE; we use
@@ -2115,9 +2121,6 @@ public final class IrisPipeline {
                 // hardcoded handful arrived as id 0, so Complementary's IPBR gave them no material at all: no gloss on
                 // obsidian/ice/metal, smoothnessD = 0, and therefore no deferred reflection on any solid.
                 String blockProps = preprocessProperties(readPackText(pack, "block.properties"));
-                // 2026-07-27 audit: reset pack-derived meshing state UNCONDITIONALLY first — a pack without
-                // block.properties used to inherit the PREVIOUS pack's layer.* forcing (glass stuck in TRANSLUCENT).
-                this.layerOverrides = null;
                 if (blockProps != null) {
                     me.jellysquid.mods.sodium.client.render.chunk.compile.pipeline.BlockRenderer.setBlockIdMapper(
                             com.yumelium.yumelium.shaders.pack.BlockIdMapper.build(
@@ -2125,7 +2128,6 @@ public final class IrisPipeline {
                     parseLayerOverrides(blockProps);
                 } else {
                     log("pack ships no block.properties — falling back to the built-in id table");
-                    me.jellysquid.mods.sodium.client.render.chunk.compile.pipeline.BlockRenderer.setBlockIdMapper(null);
                 }
                 // item.properties → heldItemId/heldItemId2, which is what COLOURS the pack's handheld light.
                 String itemProps = preprocessProperties(readPackText(pack, "item.properties"));

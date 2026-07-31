@@ -92,15 +92,15 @@ public class FluidRenderer {
         BlockPos pos = this.scratchPos.setPos(x + dir.getXOffset(), y + dir.getYOffset(), z + dir.getZOffset());
         IBlockState blockState = world.getBlockState(pos);
 
-        if (blockState.getMaterial().isOpaque()) {
-            BlockFaceShape shape = blockState.getBlockFaceShape(world, pos, dir);
-
-            if (shape == BlockFaceShape.SOLID) {
-                // The top face is always inset, so if the shape above is a full cube it can't possibly occlude
-                return dir == EnumFacing.UP;
-            } else if (shape == BlockFaceShape.UNDEFINED) {
-                return true;
-            }
+        // Forge-idiomatic culling: the neighbour's face touching this fluid fully covers it → cull. This keys on
+        // the block's RENDER shape (doesSideBlockRendering → isOpaqueCube by default), NOT its Material: modded
+        // terrain often pairs a full opaque render cube with a custom Material whose isOpaque() is false
+        // (Betweenlands mud/silt) — the old material gate skipped the shape check entirely there and emitted water
+        // side faces flush against every such wall, which the shader pack then rendered as a floating reflective
+        // "water surface" film on underwater walls (2026-07-29).
+        if (blockState.doesSideBlockRendering(world, pos, dir.getOpposite())) {
+            // The top face is always inset, so a full cube above can't possibly occlude it
+            return dir == EnumFacing.UP;
         }
 
         return true;

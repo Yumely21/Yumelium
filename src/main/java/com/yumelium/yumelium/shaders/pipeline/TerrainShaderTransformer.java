@@ -475,6 +475,12 @@ public final class TerrainShaderTransformer {
      * RESULT: the stripes PERSISTED in the raw albedo → they are atlas-mipmap black fringes (fixed via iris_MipBias). */
     private static final boolean DEBUG_FOLIAGE_ALBEDO = false;
 
+    /** DIAGNOSTIC: write the exact transformed terrain/water fragment handed to GL to iris_&lt;what&gt;_dump.fsh in the
+     * run directory on every successful compile (~1.4MB water + ~0.8MB terrain each time). 2026-07-27 audit #7: this
+     * write used to be unconditional — gated per the DIAG_* convention. Failure diagnostics are unaffected:
+     * ShaderChunkRenderer writes its own iris_water_dump pair in its catch block when a compile actually fails. */
+    private static final boolean DIAG_DUMP_TRANSFORMED = false;
+
     private static String transformFragmentLegacy(String packFragment, String what) {
         String body = stripVersion(packFragment);
         body = replaceWord(body, "gtexture", "u_BlockTex");
@@ -524,15 +530,18 @@ public final class TerrainShaderTransformer {
                 + "in vec2 iris_dbgUV;\n"
                 + "in float iris_MipBias;\n" // per-material atlas mip bias (see the texture2D bias above)
                 + body + tail;
-        dump("iris_" + what + "_dump.fsh", out);
+        if (DIAG_DUMP_TRANSFORMED) {
+            dump("iris_" + what + "_dump.fsh", out);
+        }
         return out;
     }
 
     /**
      * Writes the EXACT source handed to GL, so what the terrain shader really compiles can be read instead of inferred
-     * from the pack file plus a chain of transforms. Cheap, once per compile, and it has already been needed: the
-     * pack's gbuffers_terrain reaches GL through applyOptions (options + every DIAG_* source injection) and then
-     * transformFragment's legacy branch, and a claim about what survives all that is worth exactly nothing unverified.
+     * from the pack file plus a chain of transforms — the pack's gbuffers_terrain reaches GL through applyOptions
+     * (options + every DIAG_* source injection) and then transformFragment's legacy branch, and a claim about what
+     * survives all that is worth exactly nothing unverified. Call sites gate this behind DIAG_* flags
+     * (DIAG_DUMP_TRANSFORMED here, DIAG_HAND_PIXEL in IrisPipeline); on-failure dumps stay unconditional.
      */
     static void dump(String name, String src) {
         try {

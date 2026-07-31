@@ -15,19 +15,20 @@ import org.spongepowered.asm.mixin.injection.Slice;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Yumelium Plus sky toggles. The whole "Sky" toggle cancels the public {@code renderSky(float,int)}; finer toggles
- * (stars, sun &amp; moon, sky colours) act inside the private {@code renderSky(BufferBuilder,float,boolean)}.
+ * Yumelium Plus sky toggles. The whole "Sky" toggle cancels the public {@code renderSky(float,int)}; the finer
+ * toggles (stars, sun &amp; moon, sky colours) hook call sites inside that same public overload.
  */
 @Mixin(RenderGlobal.class)
 public abstract class MixinRenderGlobalYumeliumPlus {
     @Unique
     // 2026-07-27 audit: these redirects previously targeted the private renderSky(BufferBuilder,F,Z) overload, but
     // every redirected call site (getSkyColor, getStarBrightness, the sun/moon Tessellator.draw slices) lives in the
-    // PUBLIC renderSky(FI)V — all four sky-element toggles were silent no-ops until retargeted here.
-    private static final String PRIVATE_RENDER_SKY = "renderSky(FI)V";
+    // PUBLIC renderSky(FI)V — all four sky-element toggles were silent no-ops until retargeted here. require = 1 on
+    // every injector so a future retarget regression fails loudly instead of reverting to silent no-ops.
+    private static final String PUBLIC_RENDER_SKY = "renderSky(FI)V";
 
     // --- Whole sky ---------------------------------------------------------------------------------------------------
-    @Inject(method = "renderSky(FI)V", at = @At("HEAD"), cancellable = true)
+    @Inject(method = "renderSky(FI)V", at = @At("HEAD"), cancellable = true, require = 1)
     private void yumelium$toggleSky(float partialTicks, int pass, CallbackInfo ci) {
         if (!SodiumClientMod.options().yumeliumPlus.renderSky) {
             ci.cancel();
@@ -35,7 +36,7 @@ public abstract class MixinRenderGlobalYumeliumPlus {
     }
 
     // --- Sky colour: return a neutral colour instead of the biome/time sky colour --------------------------------------
-    @Redirect(method = PRIVATE_RENDER_SKY, at = @At(value = "INVOKE",
+    @Redirect(method = PUBLIC_RENDER_SKY, require = 1, at = @At(value = "INVOKE",
             target = "Lnet/minecraft/client/multiplayer/WorldClient;getSkyColor(Lnet/minecraft/entity/Entity;F)Lnet/minecraft/util/math/Vec3d;"))
     private Vec3d yumelium$skyColor(WorldClient world, Entity entity, float partialTicks) {
         if (!SodiumClientMod.options().yumeliumPlus.renderSkyColors) {
@@ -45,7 +46,7 @@ public abstract class MixinRenderGlobalYumeliumPlus {
     }
 
     // --- Stars: report zero star brightness so the star VBO isn't drawn ----------------------------------------------
-    @Redirect(method = PRIVATE_RENDER_SKY, at = @At(value = "INVOKE",
+    @Redirect(method = PUBLIC_RENDER_SKY, require = 1, at = @At(value = "INVOKE",
             target = "Lnet/minecraft/client/multiplayer/WorldClient;getStarBrightness(F)F"))
     private float yumelium$stars(WorldClient world, float partialTicks) {
         if (!SodiumClientMod.options().yumeliumPlus.renderStars) {
@@ -55,7 +56,7 @@ public abstract class MixinRenderGlobalYumeliumPlus {
     }
 
     // --- Sun (the Tessellator.draw between the SUN and MOON texture binds) --------------------------------------------
-    @Redirect(method = PRIVATE_RENDER_SKY,
+    @Redirect(method = PUBLIC_RENDER_SKY, require = 1,
             slice = @Slice(
                     from = @At(value = "FIELD", target = "Lnet/minecraft/client/renderer/RenderGlobal;SUN_TEXTURES:Lnet/minecraft/util/ResourceLocation;"),
                     to = @At(value = "FIELD", target = "Lnet/minecraft/client/renderer/RenderGlobal;MOON_PHASES_TEXTURES:Lnet/minecraft/util/ResourceLocation;")),
@@ -65,7 +66,7 @@ public abstract class MixinRenderGlobalYumeliumPlus {
     }
 
     // --- Moon (the Tessellator.draw between the MOON texture bind and the star-brightness read) -----------------------
-    @Redirect(method = PRIVATE_RENDER_SKY,
+    @Redirect(method = PUBLIC_RENDER_SKY, require = 1,
             slice = @Slice(
                     from = @At(value = "FIELD", target = "Lnet/minecraft/client/renderer/RenderGlobal;MOON_PHASES_TEXTURES:Lnet/minecraft/util/ResourceLocation;"),
                     to = @At(value = "INVOKE", target = "Lnet/minecraft/client/multiplayer/WorldClient;getStarBrightness(F)F")),
