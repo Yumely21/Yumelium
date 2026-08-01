@@ -33,6 +33,9 @@ public class SodiumGameOptions {
         public boolean nvidiumEnabled = true;
         public NvidiumBufferSize nvidiumBufferSize = NvidiumBufferSize.GB_2;
         public NvidiumSortMode nvidiumTranslucentSort = NvidiumSortMode.SECTION;
+        // M4a: cull work items on the GPU in a task shader (frustum test against the section AABB) before the mesh
+        // stage runs. Read per frame — no renderer reload needed; silently inert when the task stage failed to build.
+        public boolean nvidiumGpuCulling = true;
 
         // Sky / environment
         public boolean renderSky = true;

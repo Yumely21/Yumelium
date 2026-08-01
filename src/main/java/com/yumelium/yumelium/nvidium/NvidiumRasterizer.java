@@ -6,7 +6,9 @@ import me.jellysquid.mods.sodium.client.SodiumClientMod;
 import me.jellysquid.mods.sodium.client.gl.compat.FogHelper;
 import me.jellysquid.mods.sodium.client.render.chunk.lists.SortedRenderLists;
 import me.jellysquid.mods.sodium.client.render.chunk.shader.ChunkFogMode;
+import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
+import org.joml.Vector4f;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL20C;
 import org.lwjgl.opengl.NVMeshShader;
@@ -21,35 +23,29 @@ import java.nio.FloatBuffer;
  * (see {@link NvidiumBackend}) with the right GL state: solid = opaque; cutout = alpha-test; translucent = blend +
  * depth-write off. Fragment samples the block atlas (unit 0) + lightmap (unit 1), both already bound by the vanilla
  * renderBlockLayer setup.
+ *
+ * <p>M4a (2026-08-01): optional GPU culling — a task shader (32 items per task workgroup) frustum-tests each work
+ * item's section AABB and launches mesh workgroups only for survivors, with ORDER-PRESERVING compaction so the
+ * CPU's far→near translucent section order survives (NV_mesh_shader rasterizes task WGs in dispatch order and
+ * children in emission order). The AABB is origin + (-8..+24): the 16-bit vertex decode is {@code pos/2048 - 8}, so
+ * that box is a strict superset of decodable geometry — the GPU cull can only drop items whose geometry cannot be
+ * visible, correct by construction. The task stage is built in its own try/catch: if the lwjglx shim or driver
+ * rejects it, the proven mesh-only program keeps running byte-identically (this slice doubles as the task-stage
+ * go/no-go probe, M0 philosophy). Side effect: dispatch count becomes ceil(items/32), multiplying the
+ * GL_MAX_DRAW_MESH_TASKS_COUNT_NV headroom by 32.</p>
  */
 public final class NvidiumRasterizer {
     private static final NvidiumRasterizer INSTANCE = new NvidiumRasterizer();
 
-    private MeshRasterProgram program;
-    private int uProj, uModelView, uCameraBlock, uCameraFrac, uWorkItems, uGeometry, uBlockTex, uLightTex;
-    private int uWorkItemBase, uAlphaTest, uTranslucent, uSortIndex, uUseSortIndex;
-    private int uFogMode, uFogColor, uFogStart, uFogEnd, uFogDensity;
-    private FloatBuffer matrixBuffer;
-    private boolean failed;
+    /** Uniform locations of one program variant (mesh-only or task+mesh). Missing uniforms resolve to -1 and the
+     * matching glUniform* calls are silently ignored — the mesh-only variant simply has no frustum/count slots. */
+    private static final class Uniforms {
+        final int uProj, uModelView, uCameraBlock, uCameraFrac, uWorkItems, uGeometry, uBlockTex, uLightTex;
+        final int uWorkItemBase, uAlphaTest, uTranslucent, uSortIndex, uUseSortIndex;
+        final int uFogMode, uFogColor, uFogStart, uFogEnd, uFogDensity;
+        final int uWorkItemCount, uFrustumPlanes;
 
-    private NvidiumRasterizer() {
-    }
-
-    public static NvidiumRasterizer instance() {
-        return INSTANCE;
-    }
-
-    private static void log(String s) {
-        SodiumClientMod.logger().info("[Nvidium M3] " + s);
-    }
-
-    private void ensureInit() {
-        if (this.program != null || this.failed) {
-            return;
-        }
-        try {
-            this.program = new MeshRasterProgram(null, MESH_SRC, FRAG_SRC);
-            int id = this.program.id();
+        Uniforms(int id) {
             this.uProj = GL20C.glGetUniformLocation(id, "u_Proj");
             this.uModelView = GL20C.glGetUniformLocation(id, "u_ModelView");
             this.uCameraBlock = GL20C.glGetUniformLocation(id, "u_CameraBlock");
@@ -68,12 +64,73 @@ public final class NvidiumRasterizer {
             this.uFogStart = GL20C.glGetUniformLocation(id, "u_FogStart");
             this.uFogEnd = GL20C.glGetUniformLocation(id, "u_FogEnd");
             this.uFogDensity = GL20C.glGetUniformLocation(id, "u_FogDensity");
+            this.uWorkItemCount = GL20C.glGetUniformLocation(id, "u_WorkItemCount");
+            this.uFrustumPlanes = GL20C.glGetUniformLocation(id, "u_FrustumPlanes");
+        }
+    }
+
+    private MeshRasterProgram program;         // mesh-only — the proven M3b path and the permanent fallback
+    private MeshRasterProgram programCulled;   // task+mesh — null when the task stage failed to build (M4a)
+    private Uniforms uniforms;
+    private Uniforms uniformsCulled;
+    private Uniforms active;
+    private boolean gpuCullActive;
+    private FloatBuffer matrixBuffer;
+    private FloatBuffer frustumBuffer;
+    private final Matrix4f mvpScratch = new Matrix4f();
+    private final Vector4f planeScratch = new Vector4f();
+    private boolean failed;
+
+    private NvidiumRasterizer() {
+    }
+
+    public static NvidiumRasterizer instance() {
+        return INSTANCE;
+    }
+
+    private static void log(String s) {
+        SodiumClientMod.logger().info("[Nvidium M3] " + s);
+    }
+
+    /** @return whether the LAST beginDraw ran with GPU culling (F3 diagnostics). */
+    public boolean gpuCullingActive() {
+        return this.gpuCullActive;
+    }
+
+    private static boolean optionGpuCulling() {
+        try {
+            return SodiumClientMod.options().yumeliumPlus.nvidiumGpuCulling;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private void ensureInit() {
+        if (this.program != null || this.failed) {
+            return;
+        }
+        try {
+            this.program = new MeshRasterProgram(null, meshSrc(false), FRAG_SRC);
+            this.uniforms = new Uniforms(this.program.id());
             this.matrixBuffer = MemoryUtil.memAllocFloat(16);
-            log("full terrain rasterizer initialized (uBlockTex=" + this.uBlockTex + " uWorkItemBase=" + this.uWorkItemBase + ")");
+            this.frustumBuffer = MemoryUtil.memAllocFloat(24);
+            log("full terrain rasterizer initialized (uBlockTex=" + this.uniforms.uBlockTex
+                    + " uWorkItemBase=" + this.uniforms.uWorkItemBase + ")");
         } catch (Throwable t) {
             this.failed = true;
             log("rasterizer init failed (falling back to vanilla): " + t);
             NvidiumBackend.RENDER_TERRAIN = false;
+            return;
+        }
+        // The task+mesh variant fails SOFT: mesh-only rendering is proven, the task stage is not — M4a doubles as
+        // its go/no-go probe on the lwjglx shim. Never sets `failed`.
+        try {
+            this.programCulled = new MeshRasterProgram(TASK_SRC, meshSrc(true), FRAG_SRC);
+            this.uniformsCulled = new Uniforms(this.programCulled.id());
+            log("[M4a] task-shader GPU culling available");
+        } catch (Throwable t) {
+            this.programCulled = null;
+            log("[M4a] task stage unavailable — GPU culling disabled (mesh-only path unaffected): " + t);
         }
     }
 
@@ -91,12 +148,15 @@ public final class NvidiumRasterizer {
             return false;
         }
 
-        this.program.bind();
+        this.gpuCullActive = this.programCulled != null && optionGpuCulling();
+        MeshRasterProgram prog = this.gpuCullActive ? this.programCulled : this.program;
+        this.active = this.gpuCullActive ? this.uniformsCulled : this.uniforms;
+        prog.bind();
 
         projection.get(this.matrixBuffer);
-        GL20C.glUniformMatrix4fv(this.uProj, false, this.matrixBuffer);
+        GL20C.glUniformMatrix4fv(this.active.uProj, false, this.matrixBuffer);
         modelView.get(this.matrixBuffer);
-        GL20C.glUniformMatrix4fv(this.uModelView, false, this.matrixBuffer);
+        GL20C.glUniformMatrix4fv(this.active.uModelView, false, this.matrixBuffer);
 
         // Build the work-item table from Sodium's occlusion-culled visible list (no redundant frustum scan here).
         backend.syncMetadataForDraw(lists, camX, camY, camZ);
@@ -104,15 +164,15 @@ public final class NvidiumRasterizer {
         int cbx = (int) Math.floor(camX);
         int cby = (int) Math.floor(camY);
         int cbz = (int) Math.floor(camZ);
-        GL20C.glUniform3i(this.uCameraBlock, cbx, cby, cbz);
-        GL20C.glUniform3f(this.uCameraFrac, (float) (camX - cbx), (float) (camY - cby), (float) (camZ - cbz));
+        GL20C.glUniform3i(this.active.uCameraBlock, cbx, cby, cbz);
+        GL20C.glUniform3f(this.active.uCameraFrac, (float) (camX - cbx), (float) (camY - cby), (float) (camZ - cbz));
 
-        GL20C.glUniform1i(this.uBlockTex, 0);
-        GL20C.glUniform1i(this.uLightTex, 1);
-        NVShaderBufferLoad.glUniformui64NV(this.uWorkItems, backend.metadataAddress());
-        NVShaderBufferLoad.glUniformui64NV(this.uGeometry, backend.geometryAddress());
-        NVShaderBufferLoad.glUniformui64NV(this.uSortIndex, backend.sortIndexAddress());
-        GL20C.glUniform1i(this.uUseSortIndex, 0); // opaque passes never use the sort index; translucent may enable it
+        GL20C.glUniform1i(this.active.uBlockTex, 0);
+        GL20C.glUniform1i(this.active.uLightTex, 1);
+        NVShaderBufferLoad.glUniformui64NV(this.active.uWorkItems, backend.metadataAddress());
+        NVShaderBufferLoad.glUniformui64NV(this.active.uGeometry, backend.geometryAddress());
+        NVShaderBufferLoad.glUniformui64NV(this.active.uSortIndex, backend.sortIndexAddress());
+        GL20C.glUniform1i(this.active.uUseSortIndex, 0); // opaque passes never use the sort index; translucent may enable it
 
         // Fixed-function GL fog cannot touch a GLSL-460 mesh-shader program, so Nvidium terrain rendered with ZERO
         // fog — no atmospheric distance fog, and no underwater/lava EXP fog (the world looked like clear air from
@@ -121,13 +181,29 @@ public final class NvidiumRasterizer {
         // both the Yumelium Fog toggle and its water/lava exemption for free) and apply fog.glsl's formulas in the
         // fragment. GL_EXP is approximated as EXP2, same as the Sodium path.
         ChunkFogMode fogMode = FogHelper.getFogMode();
-        GL20C.glUniform1i(this.uFogMode, fogMode == ChunkFogMode.EXP2 ? 1 : fogMode == ChunkFogMode.SMOOTH ? 2 : 0);
+        GL20C.glUniform1i(this.active.uFogMode, fogMode == ChunkFogMode.EXP2 ? 1 : fogMode == ChunkFogMode.SMOOTH ? 2 : 0);
         if (fogMode != ChunkFogMode.NONE) {
             float[] fogColor = FogHelper.getFogColor();
-            GL20C.glUniform4f(this.uFogColor, fogColor[0], fogColor[1], fogColor[2], fogColor[3]);
-            GL20C.glUniform1f(this.uFogStart, FogHelper.getFogStart());
-            GL20C.glUniform1f(this.uFogEnd, FogHelper.getFogEnd());
-            GL20C.glUniform1f(this.uFogDensity, FogHelper.getFogDensity());
+            GL20C.glUniform4f(this.active.uFogColor, fogColor[0], fogColor[1], fogColor[2], fogColor[3]);
+            GL20C.glUniform1f(this.active.uFogStart, FogHelper.getFogStart());
+            GL20C.glUniform1f(this.active.uFogEnd, FogHelper.getFogEnd());
+            GL20C.glUniform1f(this.active.uFogDensity, FogHelper.getFogDensity());
+        }
+
+        if (this.gpuCullActive) {
+            // Frustum planes of proj*modelView act on CAMERA-RELATIVE coordinates — exactly the space the mesh
+            // shader's sectionRel (and the task shader's AABB) lives in, so no extra transform is needed. JOML's
+            // frustumPlane yields inward-pointing plane normals: a box is visible iff its positive vertex is on or
+            // above every plane. Unnormalized planes are fine for the sign test.
+            this.mvpScratch.set(projection).mul(modelView);
+            this.frustumBuffer.clear();
+            for (int p = 0; p < 6; p++) {
+                this.mvpScratch.frustumPlane(p, this.planeScratch);
+                this.frustumBuffer.put(this.planeScratch.x).put(this.planeScratch.y)
+                        .put(this.planeScratch.z).put(this.planeScratch.w);
+            }
+            this.frustumBuffer.flip();
+            GL20C.glUniform4fv(this.active.uFrustumPlanes, this.frustumBuffer);
         }
         return true;
     }
@@ -138,10 +214,12 @@ public final class NvidiumRasterizer {
         if (count <= 0) {
             return;
         }
-        GL20C.glUniform1i(this.uWorkItemBase, backend.passItemBase(pass));
-        GL20C.glUniform1i(this.uAlphaTest, alphaTest);
-        GL20C.glUniform1i(this.uTranslucent, translucent);
-        NVMeshShader.glDrawMeshTasksNV(0, count);
+        GL20C.glUniform1i(this.active.uWorkItemBase, backend.passItemBase(pass));
+        GL20C.glUniform1i(this.active.uAlphaTest, alphaTest);
+        GL20C.glUniform1i(this.active.uTranslucent, translucent);
+        GL20C.glUniform1i(this.active.uWorkItemCount, count);
+        // GPU culling: one TASK workgroup covers 32 work items and launches only the survivors as mesh children.
+        NVMeshShader.glDrawMeshTasksNV(0, this.gpuCullActive ? (count + 31) / 32 : count);
     }
 
     /** Draws the solid + cutout passes (opaque). @return true if it handled the pass (skip vanilla). */
@@ -196,7 +274,7 @@ public final class NvidiumRasterizer {
             net.minecraft.client.renderer.GlStateManager.enableCull();
 
             // FULL sort mode: the mesh shader reads each quad through the per-quad sort-index buffer (back-to-front).
-            GL20C.glUniform1i(this.uUseSortIndex, NvidiumBackend.instance().sortActive() ? 1 : 0);
+            GL20C.glUniform1i(this.active.uUseSortIndex, NvidiumBackend.instance().sortActive() ? 1 : 0);
             drawPass(NvidiumBackend.PASS_TRANSLUCENT, 0, 1);
 
             GL20C.glUseProgram(0);
@@ -208,8 +286,56 @@ public final class NvidiumRasterizer {
         }
     }
 
-    private static final String MESH_SRC =
+    // M4a task shader: 32 work items per task workgroup; frustum-tests each item's section AABB and emits only the
+    // survivors, in ascending item order (order-preserving compaction — MANDATORY for the translucent pass, whose
+    // far→near section order must survive; NV_mesh_shader rasterizes children in emission order).
+    private static final String TASK_SRC =
             "#version 460\n" +
+            "#extension GL_NV_mesh_shader : require\n" +
+            "#extension GL_NV_gpu_shader5 : require\n" +
+            "#extension GL_NV_shader_buffer_load : require\n" +
+            "layout(local_size_x = 32) in;\n" +
+            "uniform int* u_WorkItems;\n" +
+            "uniform int u_WorkItemBase;\n" +
+            "uniform int u_WorkItemCount;\n" +
+            "uniform ivec3 u_CameraBlock;\n" +
+            "uniform vec3 u_CameraFrac;\n" +
+            "uniform vec4 u_FrustumPlanes[6];\n" +
+            "taskNV out Task { uint itemIdx[32]; } OUT;\n" +
+            "shared uint s_vis;\n" +
+            "void main() {\n" +
+            "    uint lid = gl_LocalInvocationID.x;\n" +
+            "    if (lid == 0u) s_vis = 0u;\n" +
+            "    barrier();\n" +
+            "    uint gi = gl_WorkGroupID.x * 32u + lid;\n" +
+            "    if (gi < uint(u_WorkItemCount)) {\n" +
+            "        int wi = (u_WorkItemBase + int(gi)) * 8;\n" +
+            // Section AABB = origin + (-8..+24): the 16-bit vertex decode is pos/2048-8, so geometry may legally
+            // span that whole box — a strict superset, hence conservative (never culls potentially-visible items).
+            "        vec3 lo = vec3(ivec3(u_WorkItems[wi+2], u_WorkItems[wi+3], u_WorkItems[wi+4]) - u_CameraBlock)\n" +
+            "                  - u_CameraFrac - vec3(8.0);\n" +
+            "        vec3 hi = lo + vec3(32.0);\n" +
+            "        bool visible = true;\n" +
+            "        for (int p = 0; p < 6 && visible; p++) {\n" +
+            "            vec4 pl = u_FrustumPlanes[p];\n" +
+            "            vec3 v = mix(lo, hi, greaterThan(pl.xyz, vec3(0.0)));\n" + // positive vertex
+            "            visible = dot(pl.xyz, v) + pl.w >= 0.0;\n" +
+            "        }\n" +
+            "        if (visible) atomicOr(s_vis, 1u << lid);\n" +
+            "    }\n" +
+            "    barrier();\n" +
+            "    if (lid == 0u) {\n" +
+            "        uint mask = s_vis, n = 0u, base = gl_WorkGroupID.x * 32u;\n" +
+            "        while (mask != 0u) { uint i = findLSB(mask); mask &= mask - 1u; OUT.itemIdx[n++] = base + i; }\n" +
+            "        gl_TaskCountNV = n;\n" +
+            "    }\n" +
+            "}\n";
+
+    /** Builds the mesh shader source; {@code tasked} adds the task payload input and indexes work items through it
+     * (child i of a task workgroup renders survivor i) — the ONLY two differences from the proven mesh-only source,
+     * assembled from one template so the variants can never drift apart. */
+    private static String meshSrc(boolean tasked) {
+        return "#version 460\n" +
             "#extension GL_NV_mesh_shader : require\n" +
             "#extension GL_NV_gpu_shader5 : require\n" +
             "#extension GL_NV_shader_buffer_load : require\n" +
@@ -224,9 +350,12 @@ public final class NvidiumRasterizer {
             "uniform ivec3 u_CameraBlock;\n" +
             "uniform vec3 u_CameraFrac;\n" +
             "uniform int u_WorkItemBase;\n" +
+            (tasked ? "taskNV in Task { uint itemIdx[32]; } IN;\n" : "") +
             "layout(location = 0) out VertexData { vec4 color; vec2 uv; vec2 lightUV; float desaturate; float fragDist; } v_out[];\n" +
             "void main() {\n" +
-            "    int wi = (u_WorkItemBase + int(gl_WorkGroupID.x)) * 8;\n" +
+            (tasked
+                ? "    int wi = (u_WorkItemBase + int(IN.itemIdx[gl_WorkGroupID.x])) * 8;\n"
+                : "    int wi = (u_WorkItemBase + int(gl_WorkGroupID.x)) * 8;\n") +
             "    int byteOffset = u_WorkItems[wi + 0];\n" +
             "    int numQuads = u_WorkItems[wi + 1];\n" +
             "    ivec3 origin = ivec3(u_WorkItems[wi + 2], u_WorkItems[wi + 3], u_WorkItems[wi + 4]);\n" +
@@ -274,6 +403,7 @@ public final class NvidiumRasterizer {
             "        gl_PrimitiveCountNV = uint(numQuads) * 2u;\n" +
             "    }\n" +
             "}\n";
+    }
 
     private static final String FRAG_SRC =
             "#version 460\n" +

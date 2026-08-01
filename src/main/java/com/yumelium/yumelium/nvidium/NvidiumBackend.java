@@ -124,7 +124,8 @@ public final class NvidiumBackend {
             return list;
         }
         list.add("mode: " + (RENDER_TERRAIN ? "mesh-shader terrain" : MIRROR ? "mirror only" : "off")
-                + (shadersActive ? " (suspended: shaders active)" : ""));
+                + (shadersActive ? " (suspended: shaders active)" : "")
+                + (RENDER_TERRAIN ? ", cull: " + (NvidiumRasterizer.instance().gpuCullingActive() ? "gpu-frustum" : "cpu") : ""));
         list.add(String.format("geometry: %dMB used / %dMB alloc (cap %dMB), resident sections: %d",
                 this.arena == null ? 0 : this.arena.used() >> 20, this.geometryBytes >> 20,
                 this.maxGeometryBytes >> 20, this.sections.size()));
