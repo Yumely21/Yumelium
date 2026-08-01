@@ -257,15 +257,29 @@ public class BlockRenderer {
             case DefaultMaterials.FOLIAGE_GROUNDED: return 10005;
             case DefaultMaterials.FOLIAGE_LEAVES:   return 10009;
             case DefaultMaterials.FOLIAGE_UPPER:    return 10021;
-            default:                                return 0;
         }
-        // NOTE: opaque solid blocks intentionally return 0 (not a generic "10000"). mc_Entity feeds BOTH the colored-light
-        // voxelization (UpdateVoxelMap → occluder) AND the WSR scene voxelization (UpdateSceneVoxelMap → matM stored in
-        // wsr_img → terrainIPBR material handling on reflection read). A fake 10000 would make walls occlude coloured light,
-        // but it pollutes the WSR material channel for every solid block (mat=10000 ≠ its real block.properties id), which
-        // risks the reflection material handling. Giving solids their REAL block.properties ids (so both systems agree) is
-        // the correct fix and is deferred; until then, 0 keeps WSR reflections correct at the cost of some indoor light leak.
+        // Unmapped block (all modded blocks — the pack ships only minecraft: entries — plus a few leftover vanilla
+        // states). Real Iris sends -1 here, which this pack folds to mat 0 (int(-1.0 + 0.5) == 0): WSR voxelizes it
+        // as generic material 1, but the colored-light voxelizer treats it as AIR (mat < 10000) — that air is the
+        // indoor light leak through modded (e.g. Betweenlands) walls. For opaque full cubes we can improve on
+        // parity: the pack's OWN no-properties solid id (Complementary block.11110, resolved from the active pack's
+        // table — see BlockIdMapper.genericSolidId) makes the wall occlude the flood fill (GetVoxelIDs → default 1)
+        // while the WSR read side lands in terrainIPBR's no-op [11024,11112) branch — rendering identically to
+        // matM=1. Non-opaque unmapped blocks stay 0: a synthesized id would either mis-bucket them in terrainIPBR's
+        // range tree or (odd ids) remove them from reflections entirely. NEVER use a fake band-internal id (10000
+        // lands in the flowers branch) or 0xFFFF (escapes the odd-mat check → accidental occluder + garbage matM).
+        // getLightValue() == 0: EMITTING unmapped blocks (modded lamps: opaque cube, lightValue 15) must KEEP
+        // mat 0 — Complementary's mod-support auto-emission (gbuffers_terrain "if (mat == 0) DoAutomaticEmission")
+        // is exactly the mat==0 path, and the generic-solid id would strip their glow (2026-08-01 review).
+        if (GENERIC_SOLID_FALLBACK && mapper != null && state.getLightValue() == 0 && state.isOpaqueCube()) {
+            return mapper.genericSolidId(); // 0 when the pack declares no such bucket → behavior unchanged
+        }
+        return 0;
     }
+
+    /** Kill switch for the unmapped-opaque-solid fallback id (SOUL_FIRE_EMULATION pattern): flip false to restore
+     * strict real-Iris parity (unmapped → 0) for A/B debugging. */
+    private static final boolean GENERIC_SOLID_FALLBACK = true;
 
     private boolean isFaceVisible(BlockRenderContext ctx, EnumFacing face) {
         // Connected glass: a glass face that meets another glass block or an opaque block is invisible and would

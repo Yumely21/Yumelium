@@ -300,6 +300,16 @@ public final class BlockIdMapper {
         return this.byState.size();
     }
 
+    /** The pack's own "solid block with no properties" material id (Complementary {@code block.11110}), or 0 when
+     * the pack declares no such bucket. Used as the fallback {@code mc_Entity} id for UNMAPPED opaque full cubes
+     * (all modded solids — the pack ships only {@code minecraft:} entries) so they occlude the colored-light flood
+     * fill instead of reading as air; see BlockRenderer.blockId for the full consumer analysis. */
+    private int genericSolidId;
+
+    public int genericSolidId() {
+        return this.genericSolidId;
+    }
+
     /**
      * 1.12.2 encodes some 1.13 boolean properties as SEPARATE BLOCKS (lit_furnace vs furnace, redstone_torch vs
      * unlit_redstone_torch, …). Those blocks can't express the pack's {@code lit=}/{@code powered=} qualifiers as
@@ -379,6 +389,20 @@ public final class BlockIdMapper {
             byName.computeIfAbsent(e.name, k -> new java.util.ArrayList<>()).add(e);
             m.declaredByName.put(e.name, e.id); // last-wins DECLARED table — see idForPackName
         }
+        // The pack's own "solid block with no properties" material: the id it assigns to boring solids like the
+        // cartography table (Complementary: block.11110 → terrainIPBR's no-op [11024,11112) branch on the WSR read
+        // side, GetVoxelIDs default 1 = flood-fill occluder). Read from the pack, not hardcoded, so a renumber
+        // keeps working; the evenness/band guard enforces the pack's "even = solid terrain" voxel convention — if
+        // every probe name resolves exotic, genericSolidId stays 0 and the fallback never engages. Probe order:
+        // the utility tables are never special materials in Complementary-family packs; tnt last (a pack could
+        // plausibly make tnt emissive).
+        for (String name : new String[]{"cartography_table", "fletching_table", "smithing_table", "tnt"}) {
+            Integer id = m.declaredByName.get(name);
+            if (id != null && id >= 10000 && id < 30000 && (id % 2) == 0) {
+                m.genericSolidId = id;
+                break;
+            }
+        }
         // DIAGNOSTIC (END terrain shadow blink, 2026-07-25): name every id the property-aware matching CHANGED
         // relative to the old qualifier fold-down — the END-only regression appeared with this change, so the delta
         // list is the suspect pool. Grouped name:old→new with a state count, one line, logged once.
@@ -445,7 +469,8 @@ public final class BlockIdMapper {
             }
         }
         SodiumClientMod.logger().info("[Iris block.properties] mapped " + matched + " / " + states
-                + " block states to pack ids (" + String.format("%.1f", 100.0 * matched / Math.max(1, states)) + "%)");
+                + " block states to pack ids (" + String.format("%.1f", 100.0 * matched / Math.max(1, states)) + "%)"
+                + ", generic solid id = " + m.genericSolidId);
         if (!misses.isEmpty()) {
             SodiumClientMod.logger().info("[Iris block.properties] blocks with NO id (sample): "
                     + String.join(", ", misses));
