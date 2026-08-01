@@ -54,8 +54,9 @@ public class YumeliumDebugOverlay {
             event.getLeft().add(String.format("%s[%s] Shadow Maps: %dx%d depth + 2 color (+opaque snapshot), dist %db, bias %.4f",
                     COLOR, SHADER_BRAND, size, size, (int) IrisPipeline.shadowDistanceBlocks(), pipeline.shadowMapBias()));
             if (renderer != null) {
-                event.getLeft().add(String.format("%s[%s] Shadow Terrain: C: %d (underground culled: %d)",
-                        COLOR, SHADER_BRAND, renderer.getShadowSectionCount(), renderer.getShadowCulledUnderground()));
+                event.getLeft().add(String.format("%s[%s] Shadow Terrain: C: %d (underground culled: %d, list age: %df)",
+                        COLOR, SHADER_BRAND, renderer.getShadowSectionCount(), renderer.getShadowCulledUnderground(),
+                        renderer.getShadowListAge()));
                 String casters = pipeline.shadowEntitiesEnabled() ? "player+mobs"
                         : pipeline.shadowPlayerEnabled() ? "player" : "off";
                 if (pipeline.shadowBlockEntitiesEnabled()) {

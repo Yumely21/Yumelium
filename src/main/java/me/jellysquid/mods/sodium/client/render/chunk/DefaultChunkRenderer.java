@@ -68,6 +68,15 @@ public class DefaultChunkRenderer extends ShaderChunkRenderer {
         // In the shadow pass, drop sections outside the shadow map's coverage (the pass reuses the camera-visible set, so
         // without this it re-draws the whole render distance into a map that only spans ~192 blocks — huge waste far out).
         boolean shadowCull = shadowPass;
+        // Light-facing slice culling for the shadow terrain passes (SOLID+CUTOUT): a quad whose slice normal faces
+        // away from the sun can never be the nearest-to-light depth over convex block geometry, so its slice is
+        // skipped outside the voxel volume (see getLightFacingSlices). TRANSLUCENT stays full — it is the
+        // caustics/shadowcolor + translucent-emitter voxelization pass, and it can be index-sorted.
+        int shadowSliceMask = ModelQuadFacing.ALL;
+        if (shadowPass && renderPass != me.jellysquid.mods.sodium.client.render.chunk.terrain.DefaultTerrainRenderPasses.TRANSLUCENT) {
+            shadowSliceMask = getLightFacingSlices(
+                    com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().shadowLightDirection());
+        }
         SodiumGameOptions.MultiDrawMode drawMode = this.resolveDrawMode();
 
         ChunkShaderInterface shader = this.activeProgram.getInterface();
@@ -88,7 +97,7 @@ public class DefaultChunkRenderer extends ShaderChunkRenderer {
                 continue;
             }
 
-            fillCommandBuffer(this.batch, region, storage, renderList, camera, renderPass, useBlockFaceCulling, shadowCull);
+            fillCommandBuffer(this.batch, region, storage, renderList, camera, renderPass, useBlockFaceCulling, shadowCull, shadowSliceMask);
 
             if (this.batch.isEmpty()) {
                 continue;
@@ -157,7 +166,8 @@ public class DefaultChunkRenderer extends ShaderChunkRenderer {
                                           CameraTransform camera,
                                           TerrainRenderPass pass,
                                           boolean useBlockFaceCulling,
-                                          boolean shadowCull) {
+                                          boolean shadowCull,
+                                          int shadowSliceMask) {
         batch.clear();
 
         var iterator = renderList.sectionsWithGeometryIterator(pass.isReverseOrder());
@@ -173,6 +183,12 @@ public class DefaultChunkRenderer extends ShaderChunkRenderer {
         int indexPointerMask = pass.isSorted() ? 0xFFFFFFFF : 0;
 
         var pipeline = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance();
+        // Colored lighting: sections inside the camera-anchored voxel volume must bypass this cull too, mirroring
+        // updateShadowRenderList's exemption — the list build let them through, but this encode-time re-cull was
+        // missing the exemption and silently dropped voxel-box CORNER sections under diagonal sun azimuths (corner
+        // radius 208·√2 ≈ 294 > the ±216 across-sun extent), so their light sources never voxelized and the
+        // flood-fill lost them (2026-08-01). null when the pack/config has no colored lighting.
+        int[] shadowVoxHalf = shadowCull ? pipeline.voxelVolumeHalfExtents() : null;
 
         while (iterator.hasNext()) {
             int sectionIndex = iterator.nextByteAsInt();
@@ -182,9 +198,19 @@ public class DefaultChunkRenderer extends ShaderChunkRenderer {
             int chunkZ = originZ + LocalSectionIndex.unpackZ(sectionIndex);
 
             // Shadow pass: skip sections outside the shadow map's coverage (see IrisPipeline.isSectionOutsideShadow).
-            if (shadowCull && pipeline.isSectionOutsideShadow(
-                    (chunkX << 4) + 8 - camera.intX, (chunkY << 4) + 8 - camera.intY, (chunkZ << 4) + 8 - camera.intZ)) {
-                continue;
+            boolean inVoxelVolume = false;
+            if (shadowCull) {
+                int rx = (chunkX << 4) + 8 - camera.intX;
+                int ry = (chunkY << 4) + 8 - camera.intY;
+                int rz = (chunkZ << 4) + 8 - camera.intZ;
+                // +16: section extent plus the voxelizer's sub-block offsets — same margin as the list build.
+                inVoxelVolume = shadowVoxHalf != null
+                        && Math.abs(rx) <= shadowVoxHalf[0] + 16
+                        && Math.abs(ry) <= shadowVoxHalf[1] + 16
+                        && Math.abs(rz) <= shadowVoxHalf[2] + 16;
+                if (!inVoxelVolume && pipeline.isSectionOutsideShadow(rx, ry, rz)) {
+                    continue;
+                }
             }
 
             var pMeshData = renderDataStorage.getDataPointer(sectionIndex);
@@ -193,6 +219,10 @@ public class DefaultChunkRenderer extends ShaderChunkRenderer {
 
             if (useBlockFaceCulling && !pass.isSorted()) {
                 slices = getVisibleFaces(camera.intX, camera.intY, camera.intZ, chunkX, chunkY, chunkZ);
+            } else if (shadowCull && !inVoxelVolume) {
+                // Light-facing slice cull. ALL inside the voxel volume — the shadow VERTEX shader is the voxelizer
+                // (imageStore), so every quad of a light source must still run its vertices there.
+                slices = shadowSliceMask; // == ALL on the TRANSLUCENT shadow sub-pass
             } else {
                 slices = ModelQuadFacing.ALL;
             }
@@ -232,6 +262,26 @@ public class DefaultChunkRenderer extends ShaderChunkRenderer {
     private static final int MODEL_NEG_X      = ModelQuadFacing.NEG_X.ordinal();
     private static final int MODEL_NEG_Y      = ModelQuadFacing.NEG_Y.ordinal();
     private static final int MODEL_NEG_Z      = ModelQuadFacing.NEG_Z.ordinal();
+
+    // Epsilon band for light-facing slice culling in the shadow pass: keeps slices that are near edge-on to the
+    // light. Must cover the pack shadow vertex's DoWave leaf tilt (a few degrees) and the sunPathRotation=0 case
+    // where the light's Z component is exactly 0 all day.
+    private static final float SHADOW_SLICE_EPS = 0.1F;
+
+    /** Slices that can contain the nearest-to-light depth: keep a slice iff its normal is within the epsilon band
+     * of facing the light ({@code dot(sliceNormal, dirToLight) > -EPS}); UNASSIGNED (non-axis-aligned quads) always
+     * drawn. Constant per pass — a directional light with an ortho projection has no per-section variance. A
+     * diagonal sun drops 3 of the 6 axis slices; a sun lying in a coordinate plane drops 2, exactly vertical 1. */
+    private static int getLightFacingSlices(org.joml.Vector3fc l) {
+        int planes = (1 << MODEL_UNASSIGNED);
+        if (l.x() > -SHADOW_SLICE_EPS) planes |= 1 << MODEL_POS_X;
+        if (l.x() <  SHADOW_SLICE_EPS) planes |= 1 << MODEL_NEG_X;
+        if (l.y() > -SHADOW_SLICE_EPS) planes |= 1 << MODEL_POS_Y;
+        if (l.y() <  SHADOW_SLICE_EPS) planes |= 1 << MODEL_NEG_Y;
+        if (l.z() > -SHADOW_SLICE_EPS) planes |= 1 << MODEL_POS_Z;
+        if (l.z() <  SHADOW_SLICE_EPS) planes |= 1 << MODEL_NEG_Z;
+        return planes;
+    }
 
     private static int getVisibleFaces(int originX, int originY, int originZ, int chunkX, int chunkY, int chunkZ) {
         // This is carefully written so that we can keep everything branch-less.

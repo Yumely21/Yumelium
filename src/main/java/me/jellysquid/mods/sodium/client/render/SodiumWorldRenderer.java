@@ -330,6 +330,11 @@ public class SodiumWorldRenderer {
         return this.renderSectionManager == null ? 0 : this.renderSectionManager.getShadowSectionCount();
     }
 
+    /** @return frames the current shadow list has been served from cache (0 = rebuilt this frame; diagnostic). */
+    public int getShadowListAge() {
+        return this.renderSectionManager == null ? 0 : this.renderSectionManager.getShadowListAge();
+    }
+
     /** @return how many sections the last shadow-list build dropped as buried under the terrain (diagnostic). */
     public int getShadowCulledUnderground() {
         return this.renderSectionManager == null ? 0 : this.renderSectionManager.getShadowCulledUnderground();

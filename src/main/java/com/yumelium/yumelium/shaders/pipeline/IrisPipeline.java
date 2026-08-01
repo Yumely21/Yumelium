@@ -4397,14 +4397,21 @@ public final class IrisPipeline {
      * SHADOW_DISTANCE) plus the along-sun depth range — so it never drops a caster the shadow map would actually sample.
      */
     public boolean isSectionOutsideShadow(float rx, float ry, float rz) {
+        return isSectionOutsideShadow(rx, ry, rz, 0.0F);
+    }
+
+    /** {@code margin}: extra blocks of slack on every bound — used by the shadow-list CACHE build so the cached
+     * list provably covers the camera/sun drift allowed below the rebuild thresholds (see
+     * RenderSectionManager.SHADOW_LIST_MARGIN). Encode-time culling passes 0. */
+    public boolean isSectionOutsideShadow(float rx, float ry, float rz, float margin) {
         Matrix4f m = this.shadowModelView;
         float lx = m.m00() * rx + m.m10() * ry + m.m20() * rz + m.m30();
         float ly = m.m01() * rx + m.m11() * ry + m.m21() * rz + m.m31();
-        if (Math.abs(lx) > SHADOW_CULL_EXTENT || Math.abs(ly) > SHADOW_CULL_EXTENT) {
+        if (Math.abs(lx) > SHADOW_CULL_EXTENT + margin || Math.abs(ly) > SHADOW_CULL_EXTENT + margin) {
             return true;
         }
         float lz = m.m02() * rx + m.m12() * ry + m.m22() * rz + m.m32();
-        return lz > 24.0F || lz < -(2.0F * SHADOW_EYE_DISTANCE) - 24.0F;
+        return lz > 24.0F + margin || lz < -(2.0F * SHADOW_EYE_DISTANCE) - 24.0F - margin;
     }
 
     /** Half-extents of the pack's camera-anchored colored-lighting voxel volume, or {@code null} when colored lighting
@@ -4865,6 +4872,14 @@ public final class IrisPipeline {
 
     /** DIAGNOSTIC: shadow light direction as last built by computeShadowMatrices (for the [shadow probe] log). */
     private final Vector3f diagShadowLight = new Vector3f();
+
+    /** WORLD-space unit vector toward the shadow light — set by computeShadowMatrices at the top of every shadow
+     * frame (including the degenerate-light (0,1,0) guard + normalize), so it is fresh anywhere inside the shadow
+     * pass and at updateShadowRenderList time. Consumers: the shadow-list cache (sun-drift invalidation) and the
+     * shadow light-facing slice cull. Read-only view — do not mutate. */
+    public org.joml.Vector3fc shadowLightDirection() {
+        return this.diagShadowLight;
+    }
 
     /**
      * DIAGNOSTIC (mob shadows, "only the loop's first entity lands"): snapshot of every pipeline state a

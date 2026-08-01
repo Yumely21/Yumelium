@@ -93,13 +93,43 @@ public class RenderSectionManager {
      * Frame counter for the shadow list build, SEPARATE from the camera's {@link #lastUpdatedFrame}.
      *
      * <p>It must have its own, because {@code ChunkRenderList} only clears itself when handed a frame number it has not
-     * seen ({@code if (getLastVisibleFrame() != frame) reset(frame)}), and the shadow list is rebuilt EVERY frame while
-     * {@code lastUpdatedFrame} only advances when the camera traversal re-runs. Reusing it meant the reset stopped firing
-     * on every frame that skipped a camera update, so sections were appended to the previous frame's list until it
-     * overflowed — {@code ArrayIndexOutOfBoundsException: Render list is full} — which aborted the shadow pass and left
-     * the shadow map half-drawn, i.e. the shadows vanished.</p>
+     * seen ({@code if (getLastVisibleFrame() != frame) reset(frame)}), and the shadow list is rebuilt independently of
+     * the camera traversal. Reusing the camera counter meant the reset stopped firing on every frame that skipped a
+     * camera update, so sections were appended to the previous frame's list until it overflowed —
+     * {@code ArrayIndexOutOfBoundsException: Render list is full} — which aborted the shadow pass and left the shadow
+     * map half-drawn, i.e. the shadows vanished. Since the frame-to-frame cache landed, the counter advances once per
+     * REBUILD (not per frame) — the reset argument is unchanged because it keys on inequality, not on +1.</p>
      */
     private int shadowFrame;
+
+    // --- shadow-list frame-to-frame cache -------------------------------------------------------------------------
+    // The 67k-section walk in updateShadowRenderList cost 2-3 ms CPU EVERY frame at rd32. The cached list is only a
+    // candidate SET — draw positions and the encode-time cull always use the CURRENT camera and matrices
+    // (DefaultChunkRenderer), so over-inclusion is harmless and only OMISSION matters. The build therefore culls
+    // with SHADOW_LIST_MARGIN of extra slack, and the list is rebuilt before the allowed drift can consume it.
+    /** Topology/geometry changed since the last build (set by {@link #updateSectionInfo}). */
+    private boolean shadowListDirty = true;
+    private double shadowListCameraX, shadowListCameraY, shadowListCameraZ;
+    private final org.joml.Vector3f shadowListLightDir = new org.joml.Vector3f();
+    /** computeShadowMatrices' up-vector branch selector (|light.y| > 0.99) at build time: when the sun crosses that
+     * threshold the light-space X/Y basis ROLLS discontinuously, which the direction-drift test cannot see — the
+     * square |lx|,|ly| cull is basis-dependent, so a roll invalidates the cached list even with an unchanged light
+     * direction (only reachable with user SUN_ANGLE settings that take the sun near vertical). */
+    private boolean shadowListUpFlipped;
+    private int[] shadowListVoxHalf;
+    private int shadowListAge;
+
+    /** Max per-axis camera drift (blocks) tolerated before rebuild. Paired invariant with SHADOW_LIST_MARGIN:
+     * √3·THIS + 0.00873·673 (0.5° light rotation at the box's max radius) ≈ 19.7 ≤ MARGIN + ~10 (shadow box slack),
+     * and THIS ≤ MARGIN − 8 (voxel box, per-axis). Change one ⇒ re-derive the other. */
+    private static final double SHADOW_LIST_REBUILD_DISTANCE = 8.0;
+    /** Extra cull slack (blocks) applied ONLY at list build, so the cached list provably covers the drift above. */
+    private static final float SHADOW_LIST_MARGIN = 16.0F;
+    /** cos(0.5°): rebuild when the shadow light has rotated more than half a degree since the build. Do not tighten
+     * below ~cos(0.05°) — it would drown in normalize() float noise and rebuild every frame. */
+    private static final float SHADOW_LIST_LIGHT_DOT_MIN = 0.99996192F;
+    /** Belt-and-braces TTL: force a rebuild at least every N frames (~10 s at 60 fps). */
+    private static final int SHADOW_LIST_MAX_AGE = 600;
 
     /** Drop shadow-pass sections that are buried under the terrain — see {@link #isFullyUnderground}. */
     private static final boolean SHADOW_CULL_UNDERGROUND = true;
@@ -389,10 +419,30 @@ public class RenderSectionManager {
      */
     public void updateShadowRenderList() {
         var pipeline = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance();
+        var camera = pipeline.shadowCameraPos();
+        var light = pipeline.shadowLightDirection();
+        int[] cacheVoxHalf = pipeline.voxelVolumeHalfExtents();
+
+        // Frame-to-frame cache: reuse the retained shadowRenderLists while the world and the shadow box are close
+        // enough to the build-time state. Only the candidate SET is cached — draw positions and the encode-time cull
+        // (DefaultChunkRenderer) always use the CURRENT camera/matrices, so a stale list can only over-include
+        // (harmless) once the build margins cover the allowed drift. Stale entries cannot crash: a removed section
+        // draws nothing (zeroed mesh data) and a deleted region is skipped (null storage).
+        boolean cameraMoved = Math.abs(camera.x - this.shadowListCameraX) > SHADOW_LIST_REBUILD_DISTANCE
+                || Math.abs(camera.y - this.shadowListCameraY) > SHADOW_LIST_REBUILD_DISTANCE
+                || Math.abs(camera.z - this.shadowListCameraZ) > SHADOW_LIST_REBUILD_DISTANCE;
+        boolean lightMoved = this.shadowListLightDir.dot(light.x(), light.y(), light.z()) < SHADOW_LIST_LIGHT_DOT_MIN;
+        boolean upFlipped = Math.abs(light.y()) > 0.99F;
+        boolean voxChanged = !java.util.Arrays.equals(cacheVoxHalf, this.shadowListVoxHalf);
+        if (!this.shadowListDirty && !cameraMoved && !lightMoved && upFlipped == this.shadowListUpFlipped && !voxChanged
+                && this.shadowListAge < SHADOW_LIST_MAX_AGE) {
+            this.shadowListAge++;
+            return; // reuse this.shadowRenderLists; shadowFrame deliberately NOT incremented (no reset needed)
+        }
+
         // Its OWN counter — see the shadowFrame field. Using the camera's lastUpdatedFrame overflowed the lists.
         var collector = new VisibleChunkCollector(++this.shadowFrame, true);
 
-        var camera = pipeline.shadowCameraPos();
         this.chunkLowestHeight.clear();
         int visited = 0;
         int culledUnderground = 0;
@@ -404,7 +454,7 @@ public class RenderSectionManager {
         // world counted as "buried", nothing was voxelized, and e.g. the nether portal lost its purple self-light
         // (replaced by a runaway screen-space-blocklight feedback = the blazing portal). Also fixes torch/portal
         // colored light in overworld caves. null when the pack/config has no colored lighting → culls run as before.
-        int[] voxHalf = pipeline.voxelVolumeHalfExtents();
+        int[] voxHalf = cacheVoxHalf;
 
         for (var section : this.sectionByPosition.values()) {
             // Section centre, relative to the camera — the space the shadow matrices are built in.
@@ -413,12 +463,14 @@ public class RenderSectionManager {
             float rz = (float) ((section.getOriginZ() + 8) - camera.z);
 
             // +16: the section's own extent (±8 around its centre) plus the voxelizer's sub-block offsets.
+            // +SHADOW_LIST_MARGIN: build-only slack so the CACHED list stays a superset of the encode-time
+            // exemption for any camera drift below the rebuild threshold (colored light must never pop).
             boolean inVoxelVolume = voxHalf != null
-                    && Math.abs(rx) <= voxHalf[0] + 16.0F
-                    && Math.abs(ry) <= voxHalf[1] + 16.0F
-                    && Math.abs(rz) <= voxHalf[2] + 16.0F;
+                    && Math.abs(rx) <= voxHalf[0] + 16.0F + SHADOW_LIST_MARGIN
+                    && Math.abs(ry) <= voxHalf[1] + 16.0F + SHADOW_LIST_MARGIN
+                    && Math.abs(rz) <= voxHalf[2] + 16.0F + SHADOW_LIST_MARGIN;
             if (!inVoxelVolume) {
-                if (pipeline.isSectionOutsideShadow(rx, ry, rz)) {
+                if (pipeline.isSectionOutsideShadow(rx, ry, rz, SHADOW_LIST_MARGIN)) {
                     continue;
                 }
                 if (SHADOW_CULL_UNDERGROUND && isFullyUnderground(section)) {
@@ -434,6 +486,16 @@ public class RenderSectionManager {
         this.shadowRenderLists = collector.createRenderLists();
         this.shadowSectionCount = visited;
         this.shadowCulledUnderground = culledUnderground;
+
+        // Record the cache key of this build.
+        this.shadowListDirty = false;
+        this.shadowListAge = 0;
+        this.shadowListCameraX = camera.x;
+        this.shadowListCameraY = camera.y;
+        this.shadowListCameraZ = camera.z;
+        this.shadowListLightDir.set(light.x(), light.y(), light.z());
+        this.shadowListUpFlipped = Math.abs(light.y()) > 0.99F;
+        this.shadowListVoxHalf = cacheVoxHalf == null ? null : cacheVoxHalf.clone();
     }
 
     /**
@@ -469,6 +531,11 @@ public class RenderSectionManager {
     /** @return how many sections the last {@link #updateShadowRenderList} put in the shadow list (diagnostic). */
     public int getShadowSectionCount() {
         return this.shadowSectionCount;
+    }
+
+    /** @return frames the current shadow list has been served from cache (0 = rebuilt this frame; diagnostic). */
+    public int getShadowListAge() {
+        return this.shadowListAge;
     }
 
     public void tickVisibleRenders() {
@@ -592,6 +659,11 @@ public class RenderSectionManager {
     }
 
     private void updateSectionInfo(RenderSection render, BuiltSectionInfo info) {
+        // Shadow-list cache: membership/flags/heightmap may have changed. This single site covers section add
+        // (empty branch + built results), section remove (null info), and every mesh rebuild — the underground cull
+        // depends on heightmap changes carried by rebuilds whose flags do NOT change (digging exposes a different,
+        // still-culled section below), so do not narrow this to flag transitions.
+        this.shadowListDirty = true;
         render.setInfo(info);
 
         if (info == null || ArrayUtils.isEmpty(info.globalBlockEntities)) {
