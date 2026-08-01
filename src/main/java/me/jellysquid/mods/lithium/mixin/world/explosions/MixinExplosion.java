@@ -37,18 +37,28 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * implementations (Cubic Chunks etc.) fall back to vanilla wholesale via the getClass() guard. Lithium's further
  * tricks (LongOpenHashSet, hook dedup, air skipping) are DELIBERATELY not ported — each would change observable
  * order/counts/packet contents.</p>
+ *
+ * <p>Phase 2 (2026-08-01, same research doc): the sweep's ONLY {@code new BlockPos(DDD)} (bci 202) allocates per
+ * STEP, but with a 0.3 step against 1.0 blocks ~2/3 of consecutive steps floor to the SAME coords — reuse the
+ * previous step's instance when they match. Value-wise bit-identical ({@code BlockPos(DDD)} floors via
+ * {@code MathHelper.floor} in {@code Vec3i(DDD)} — replicated exactly); the only deviation is object IDENTITY:
+ * consecutive same-block steps hand the hooks one shared immutable instance instead of fresh equal ones
+ * (research risk 8 — a mod comparing hook positions by {@code ==} across calls would notice; none known, and
+ * such a comparison is semantically wrong against immutable value types).</p>
  */
 @Mixin(Explosion.class)
 public abstract class MixinExplosion {
     private Chunk lithium$prevChunk;
     private int lithium$prevChunkX = Integer.MIN_VALUE;
     private int lithium$prevChunkZ = Integer.MIN_VALUE;
+    private BlockPos lithium$prevPos;
 
     @Inject(method = "doExplosionA", at = @At("HEAD"))
     private void lithium$resetChunkCache(CallbackInfo ci) {
         this.lithium$prevChunk = null;
         this.lithium$prevChunkX = Integer.MIN_VALUE;
         this.lithium$prevChunkZ = Integer.MIN_VALUE;
+        this.lithium$prevPos = null;
     }
 
     @Inject(method = "doExplosionA", at = @At("RETURN"))
@@ -56,6 +66,29 @@ public abstract class MixinExplosion {
         this.lithium$prevChunk = null;
         this.lithium$prevChunkX = Integer.MIN_VALUE;
         this.lithium$prevChunkZ = Integer.MIN_VALUE;
+        this.lithium$prevPos = null;
+    }
+
+    // Phase 2: replaces the sweep's single `new BlockPos(D,D,D)`. First NEW redirect in the project — the desc-form
+    // target is the canonical Mixin spelling for a constructor by signature; require=1 so a retarget regression
+    // fails at apply instead of silently reverting to per-step allocation.
+    @Redirect(
+            method = "doExplosionA",
+            require = 1,
+            at = @At(value = "NEW", target = "(DDD)Lnet/minecraft/util/math/BlockPos;")
+    )
+    private BlockPos lithium$reuseStepPos(double x, double y, double z) {
+        // Exactly BlockPos(DDD)'s own flooring (Vec3i(DDD) → MathHelper.floor per axis).
+        int bx = net.minecraft.util.math.MathHelper.floor(x);
+        int by = net.minecraft.util.math.MathHelper.floor(y);
+        int bz = net.minecraft.util.math.MathHelper.floor(z);
+        BlockPos prev = this.lithium$prevPos;
+        if (prev != null && prev.getX() == bx && prev.getY() == by && prev.getZ() == bz) {
+            return prev;
+        }
+        BlockPos pos = new BlockPos(bx, by, bz);
+        this.lithium$prevPos = pos;
+        return pos;
     }
 
     @Redirect(
