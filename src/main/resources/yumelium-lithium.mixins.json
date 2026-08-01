@@ -10,6 +10,7 @@
     "entity.data_tracker.MixinEntityDataManager",
     "math.sine_lut.MathHelperAccessor",
     "math.sine_lut.MixinMathHelper",
-    "world.explosions.MixinExplosion"
+    "world.explosions.MixinExplosion",
+    "world.tick_scheduler.MixinWorldServerTickScheduler"
   ]
 }
