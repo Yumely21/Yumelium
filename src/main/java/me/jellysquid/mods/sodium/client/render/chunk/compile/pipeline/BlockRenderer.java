@@ -54,6 +54,10 @@ public class BlockRenderer {
     private final ChunkVertexEncoder.Vertex[] vertices = ChunkVertexEncoder.Vertex.uninitializedQuad();
 
     private final boolean useAmbientOcclusion;
+    // Leaves Quality = FAST: cull faces between adjacent leaf blocks (Cull-Leaves / OptiFine "Trees: Smart" style)
+    // while keeping the fancy leaf texture/layer. Read once per BlockRenderer — the option's REQUIRES_RENDERER_RELOAD
+    // flag rebuilds the ChunkBuilder (and thus this object) whenever it changes.
+    private final boolean cullLeavesInnerFaces;
 
     private final int[] quadColors = new int[4];
 
@@ -72,6 +76,8 @@ public class BlockRenderer {
 
         this.occlusionCache = new BlockOcclusionCache();
         this.useAmbientOcclusion = Minecraft.isAmbientOcclusionEnabled();
+        this.cullLeavesInnerFaces = !SodiumClientMod.options().quality.leavesQuality
+                .isFancy(Minecraft.getMinecraft().gameSettings.fancyGraphics);
     }
 
     public void renderModel(BlockRenderContext ctx, ChunkBuildBuffers buffers) {
@@ -269,6 +275,23 @@ public class BlockRenderer {
                     ctx.pos().getY() + face.getYOffset(), ctx.pos().getZ() + face.getZOffset());
             net.minecraft.block.state.IBlockState neighbor = ctx.world().getBlockState(this.ctmScratch);
             if (isGlassBlock(neighbor.getBlock()) || neighbor.isOpaqueCube()) {
+                return false;
+            }
+        }
+        // Leaves inner-face culling (Cull-Leaves / OptiFine "Trees: Smart" style), active when Leaves Quality is
+        // FAST: a leaf face touching another leaf block is interior canopy detail — skip it. Both blocks drop their
+        // shared faces, so the canopy interior vanishes from the mesh; camera pass, shadow pass and Nvidium all
+        // share that mesh, so all three get the quad reduction (~40-70% fewer leaf quads in dense forests).
+        // Any-leaves vs any-leaves, like vanilla FAST across the BlockOldLeaf variants and Embeddium/Cull Leaves;
+        // instanceof BlockLeaves covers modded subclasses (Betweenlands). isFullCube on BOTH sides guards exotic
+        // non-full-cube leaves subclasses from opening visible gaps.
+        if (this.cullLeavesInnerFaces
+                && ctx.state().getBlock() instanceof net.minecraft.block.BlockLeaves
+                && ctx.state().isFullCube()) {
+            this.ctmScratch.setPos(ctx.pos().getX() + face.getXOffset(),
+                    ctx.pos().getY() + face.getYOffset(), ctx.pos().getZ() + face.getZOffset());
+            net.minecraft.block.state.IBlockState neighbor = ctx.world().getBlockState(this.ctmScratch);
+            if (neighbor.getBlock() instanceof net.minecraft.block.BlockLeaves && neighbor.isFullCube()) {
                 return false;
             }
         }
