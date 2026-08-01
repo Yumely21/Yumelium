@@ -52,8 +52,11 @@ public final class NvidiumBackend {
     private static final long STAGING_BYTES = 16L * 1024 * 1024;
     private static final long METADATA_BYTES = 16L * 1024 * 1024;
     private static final long SORT_INDEX_BYTES = 24L * 1024 * 1024; // per-frame translucent per-quad sort indices (FULL)
-    private static final int META_INTS = 8; // {byteOffset, numQuads, ox, oy, oz, sortOffset, _, _}
+    private static final int META_INTS = 8; // {byteOffset, numQuads, ox, oy, oz, sortOffset, visIdx, isNew}
     private static final int META_BYTES = META_INTS * 4;
+    /** Bytes per box-raster instance: {visIdx, ox, oy, oz}. */
+    private static final int BOX_INSTANCE_BYTES = 16;
+    private static final long INITIAL_BOX_SLOT_BYTES = 1L * 1024 * 1024; // 65536 instances/slot
 
     private boolean initialized;
     private AddressableDeviceBuffer geometry;
@@ -70,8 +73,11 @@ public final class NvidiumBackend {
     private long metadataBytes = METADATA_BYTES;
     private long sortIndexBytes = SORT_INDEX_BYTES;
 
-    // key -> {arenaOffset, totalSize, ox, oy, oz, solidQuads, cutoutQuads, translucentQuads}
+    // key -> {arenaOffset, totalSize, ox, oy, oz, solidQuads, cutoutQuads, translucentQuads, visIdx, lastBuild, isNew}
     private final Long2ObjectLinkedOpenHashMap<int[]> sections = new Long2ObjectLinkedOpenHashMap<>();
+    private static final int S_VIS_IDX = 8;
+    private static final int S_LAST_BUILD = 9;
+    private static final int S_IS_NEW = 10;
     private boolean metaDirty;
     private final int[] passItemBase = new int[3];
     private final int[] passItemCount = new int[3];
@@ -82,6 +88,7 @@ public final class NvidiumBackend {
     private boolean synced;
     private boolean lastSortSections;
     private boolean lastFullSort;
+    private boolean lastOcclusion;
     private int stagingSlot;
     private long syncLogCounter;
 
@@ -101,6 +108,28 @@ public final class NvidiumBackend {
     private long[] quadKeys = new long[1024];
     private int sortStagingSlot;
     private boolean sortActive; // whether this frame's sync wrote per-quad sort indices (FULL)
+
+    // --- M4b GPU occlusion --------------------------------------------------------------------------------------
+    // Each resident section owns a small dense "visibility index" (free-list allocated, stable while it stays
+    // resident). The box-raster pass stamps the CURRENT frame number into that entry for every section whose AABB
+    // has a depth-passing fragment; the task shader then culls sections whose stamp is stale. A PLAIN SSBO, not a
+    // bindless AddressableDeviceBuffer: the box fragment shader WRITES it, and NV_shader_buffer_load residency is a
+    // read-only contract. Sentinel 0 = "never tested" = VISIBLE, so if the stamps never arrive (driver quirk, the
+    // pass failing to build) the whole feature degrades to a no-op instead of to missing terrain.
+    private int visBuffer;
+    private int visCapacity;
+    private int nextVisIdx;
+    private int[] freeVisIdx = new int[256];
+    private int freeVisCount;
+    // Box-raster instance data {visIdx, ox, oy, oz} per visible section, triple-slot staged (bound per draw with
+    // glBindBufferRange). Rebuilt exactly when the work-item table is — same visible-set trigger.
+    private PersistentMappedBuffer boxStaging;
+    private long boxSlotBytes = INITIAL_BOX_SLOT_BYTES;
+    private int boxSlot;
+    private long boxOffset;
+    private int boxInstances;
+    /** Increments once per work-item table REBUILD — the clock the per-section "new to the visible set" flag uses. */
+    private int buildCounter;
 
     private long cumulativeBytes;
     private long mirrorCalls;
@@ -125,7 +154,9 @@ public final class NvidiumBackend {
         }
         list.add("mode: " + (RENDER_TERRAIN ? "mesh-shader terrain" : MIRROR ? "mirror only" : "off")
                 + (shadersActive ? " (suspended: shaders active)" : "")
-                + (RENDER_TERRAIN ? ", cull: " + (NvidiumRasterizer.instance().gpuCullingActive() ? "gpu-frustum" : "cpu") : ""));
+                + (RENDER_TERRAIN ? ", cull: " + (NvidiumRasterizer.instance().gpuCullingActive()
+                        ? (NvidiumRasterizer.instance().occlusionCullingActive() ? "gpu-frustum+occlusion" : "gpu-frustum")
+                        : "cpu") : ""));
         list.add(String.format("geometry: %dMB used / %dMB alloc (cap %dMB), resident sections: %d",
                 this.arena == null ? 0 : this.arena.used() >> 20, this.geometryBytes >> 20,
                 this.maxGeometryBytes >> 20, this.sections.size()));
@@ -205,6 +236,16 @@ public final class NvidiumBackend {
         }
     }
 
+    /** M4b box-raster occlusion — requires GPU culling (the test lives in the task shader). */
+    private static boolean occlusionEnabled() {
+        try {
+            return SodiumClientMod.options().yumeliumPlus.nvidiumOcclusionCulling
+                    && SodiumClientMod.options().yumeliumPlus.nvidiumGpuCulling;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     /** @return true for sort mode FULL (per-quad within-section back-to-front sorting via the sort-index buffer). */
     private static boolean fullSortEnabled() {
         try {
@@ -259,9 +300,19 @@ public final class NvidiumBackend {
             if (this.metaStaging != null) this.metaStaging.delete();
             if (this.sortIndexBuffer != null) this.sortIndexBuffer.delete();
             if (this.sortStaging != null) this.sortStaging.delete();
+            if (this.boxStaging != null) this.boxStaging.delete();
+            if (this.visBuffer != 0) GL15C.glDeleteBuffers(this.visBuffer);
         } catch (Throwable t) {
             log("reset: buffer delete error: " + t);
         }
+        this.boxStaging = null;
+        this.visBuffer = 0;
+        this.visCapacity = 0;
+        this.nextVisIdx = 0;
+        this.freeVisCount = 0;
+        this.boxInstances = 0;
+        this.boxSlot = 0;
+        this.boxOffset = 0L;
         this.geometry = null;
         this.metadata = null;
         this.arena = null;
@@ -392,7 +443,8 @@ public final class NvidiumBackend {
 
             this.sections.put(key, new int[]{
                     (int) offset, total, sx * 16, sy * 16, sz * 16,
-                    solidBytes / BYTES_PER_QUAD, cutoutBytes / BYTES_PER_QUAD, translucentBytes / BYTES_PER_QUAD
+                    solidBytes / BYTES_PER_QUAD, cutoutBytes / BYTES_PER_QUAD, translucentBytes / BYTES_PER_QUAD,
+                    allocVisIdx(), -1, 1 // visIdx, lastBuild (-1 = never in a build), isNew
             });
 
             // Keep Sodium's per-quad centers (section-local) for FULL within-section translucent sorting. NONE-level
@@ -439,8 +491,25 @@ public final class NvidiumBackend {
         if (a != null) {
             this.arena.free(a[0], a[1]);
             this.translucentCenters.remove(key);
+            releaseVisIdx(a[S_VIS_IDX]);
             this.metaDirty = true;
         }
+    }
+
+    /** @return a dense visibility index for a newly resident section, with its stamp reset to the "never tested"
+     * sentinel — a recycled index must not inherit the previous occupant's staleness (that would cull the new
+     * section for a frame). */
+    private int allocVisIdx() {
+        int idx = this.freeVisCount > 0 ? this.freeVisIdx[--this.freeVisCount] : this.nextVisIdx++;
+        clearVisEntry(idx);
+        return idx;
+    }
+
+    private void releaseVisIdx(int idx) {
+        if (this.freeVisCount == this.freeVisIdx.length) {
+            this.freeVisIdx = java.util.Arrays.copyOf(this.freeVisIdx, this.freeVisIdx.length << 1);
+        }
+        this.freeVisIdx[this.freeVisCount++] = idx;
     }
 
     /**
@@ -457,15 +526,19 @@ public final class NvidiumBackend {
         }
         boolean sortSections = translucentSortEnabled();
         boolean fullSort = fullSortEnabled();
+        boolean occlusion = occlusionEnabled();
         // Skip the rebuild when nothing that affects the work-item table changed (same visible set + geometry + sort
         // mode). A static camera keeps Sodium's list object, so this makes standing still free — but a live sort-mode
         // change still forces a rebuild so it takes effect immediately.
         if (this.synced && !this.metaDirty && lists == this.lastLists
-                && sortSections == this.lastSortSections && fullSort == this.lastFullSort) {
+                && sortSections == this.lastSortSections && fullSort == this.lastFullSort
+                && occlusion == this.lastOcclusion) {
             return;
         }
         this.lastSortSections = sortSections;
         this.lastFullSort = fullSort;
+        this.lastOcclusion = occlusion;
+        this.buildCounter++;
 
         // Collect this frame's visible resident sections once (Sodium already frustum+occlusion culled them).
         int vis = collectVisibleSections(lists);
@@ -487,6 +560,30 @@ public final class NvidiumBackend {
         ensureMetadataCapacity(requiredItems);
         if (fullSort) {
             ensureSortIndexCapacity(requiredSortInts);
+        }
+
+        // M4b: one box-raster instance per visible section (unique — Sodium lists each section once), staged into
+        // this build's slot. Kept until the next rebuild: the box positions are computed in the shader from the
+        // per-frame camera uniforms, so a retained instance list stays correct for as long as the visible set does.
+        // Nothing is allocated while occlusion culling is off (the option is part of the rebuild trigger above, so
+        // switching it on takes effect on the very next frame).
+        if (occlusion) {
+            ensureVisCapacity(this.nextVisIdx);
+            ensureBoxCapacity(vis);
+            long boxBase = this.boxStaging.address() + (long) this.boxSlot * this.boxSlotBytes;
+            for (int i = 0; i < vis; i++) {
+                int[] s = this.visibleScratch[i];
+                long p = boxBase + (long) i * BOX_INSTANCE_BYTES;
+                MemoryUtil.memPutInt(p, s[S_VIS_IDX]);
+                MemoryUtil.memPutInt(p + 4, s[2]);
+                MemoryUtil.memPutInt(p + 8, s[3]);
+                MemoryUtil.memPutInt(p + 12, s[4]);
+            }
+            this.boxInstances = vis;
+            this.boxOffset = (long) this.boxSlot * this.boxSlotBytes;
+            this.boxSlot = (this.boxSlot + 1) % 3;
+        } else {
+            this.boxInstances = 0;
         }
 
         long slotBytes = this.metadataBytes / 3;
@@ -625,6 +722,110 @@ public final class NvidiumBackend {
         log("translucent sort table grown to " + (newBytes >> 20) + "MB");
     }
 
+    // --- M4b: visibility SSBO + box-raster instance staging -------------------------------------------------------
+
+    /** Grows (or first-creates) the per-section visibility stamp buffer, cleared to the "never tested" sentinel. */
+    private void ensureVisCapacity(int entries) {
+        int needed = Math.max(entries, 1);
+        if (this.visBuffer != 0 && needed <= this.visCapacity) {
+            return;
+        }
+        int cap = Math.max(this.visCapacity, 4096);
+        while (cap < needed) {
+            cap <<= 1;
+        }
+        if (this.visBuffer != 0) {
+            // In-flight frames may still be reading (task shader) or writing (box fragment) this buffer.
+            org.lwjgl.opengl.GL11C.glFinish();
+            GL15C.glDeleteBuffers(this.visBuffer);
+        }
+        this.visBuffer = GL15C.glGenBuffers();
+        GL15C.glBindBuffer(org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER, this.visBuffer);
+        GL15C.glBufferData(org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER, (long) cap * 4L, GL15C.GL_DYNAMIC_COPY);
+        clearBoundVisBuffer();
+        GL15C.glBindBuffer(org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER, 0);
+        this.visCapacity = cap;
+    }
+
+    /** glBufferStorage/glBufferData leave undefined content — every entry must start at the sentinel 0 ("never
+     * tested" = visible), which is also what makes a never-arriving stamp degrade to no culling instead of to
+     * missing terrain. NULL data + R32UI clears the whole range to zero. */
+    private static void clearBoundVisBuffer() {
+        org.lwjgl.opengl.GL43C.nglClearBufferData(org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER,
+                org.lwjgl.opengl.GL30C.GL_R32UI, org.lwjgl.opengl.GL30C.GL_RED_INTEGER,
+                org.lwjgl.opengl.GL11C.GL_UNSIGNED_INT, 0L);
+    }
+
+    /** Reset every stamp — used when occlusion culling is switched on, so one frame of stale stamps cannot blank
+     * the world before the first box-raster pass refreshes them. */
+    public void clearVisibility() {
+        if (this.visBuffer == 0) {
+            return;
+        }
+        GL15C.glBindBuffer(org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER, this.visBuffer);
+        clearBoundVisBuffer();
+        GL15C.glBindBuffer(org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER, 0);
+    }
+
+    private static final int[] ZERO_STAMP = new int[1];
+
+    private void clearVisEntry(int idx) {
+        // Skipped entirely while occlusion culling is off: this runs once per mirrored section (dozens per frame
+        // during a chunk-load burst) and a client buffer update implicitly synchronizes against the box pass's
+        // in-flight stores. Nothing is lost — the OFF→ON transition clears every stamp (clearVisibility), and a
+        // missed clear could only leave a RECENT stamp, i.e. err toward drawing.
+        if (this.visBuffer == 0 || !occlusionEnabled() || idx >= this.visCapacity) {
+            return; // not allocated yet, or beyond the buffer — ensureVisCapacity clears the whole range anyway
+        }
+        GL15C.glBindBuffer(org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER, this.visBuffer);
+        GL15C.glBufferSubData(org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER, (long) idx * 4L, ZERO_STAMP);
+        GL15C.glBindBuffer(org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER, 0);
+    }
+
+    /** Grows (or first-creates) the triple-slot box-raster instance staging so one slot holds every visible section. */
+    private void ensureBoxCapacity(int instances) {
+        long needSlot = Math.max((long) instances * BOX_INSTANCE_BYTES, 1L);
+        if (this.boxStaging != null && needSlot <= this.boxSlotBytes) {
+            return;
+        }
+        long slot = Math.max(this.boxSlotBytes, INITIAL_BOX_SLOT_BYTES);
+        while (slot < needSlot) {
+            slot <<= 1;
+        }
+        if (this.boxStaging != null) {
+            org.lwjgl.opengl.GL11C.glFinish(); // an in-flight box draw may still be sourcing the old buffer
+            this.boxStaging.delete();
+        }
+        this.boxSlotBytes = slot;
+        this.boxStaging = new PersistentMappedBuffer(slot * 3L);
+        this.boxSlot = 0;
+        log("box-raster instance table grown to " + (slot * 3L >> 20) + "MB ("
+                + (slot / BOX_INSTANCE_BYTES) + " sections/frame)");
+    }
+
+    /** @return the visibility stamp SSBO (0 when not allocated), read by the task shader and written by the boxes. */
+    public int visBufferId() {
+        return this.visBuffer;
+    }
+
+    /** @return the buffer holding this frame's box-raster instances, or 0. */
+    public int boxInstanceBufferId() {
+        return this.boxStaging == null ? 0 : this.boxStaging.id();
+    }
+
+    public long boxInstanceOffset() {
+        return this.boxOffset;
+    }
+
+    public long boxInstanceRangeBytes() {
+        return this.boxSlotBytes;
+    }
+
+    /** @return how many section boxes the visibility pass should draw this frame. */
+    public int boxInstanceCount() {
+        return this.boxInstances;
+    }
+
     /** Gather the resident sections in Sodium's visible render list into {@link #visibleScratch}; returns the count. */
     private int collectVisibleSections(SortedRenderLists lists) {
         int vis = 0;
@@ -648,6 +849,18 @@ public final class NvidiumBackend {
                 if (vis >= this.visibleScratch.length) {
                     growScratch(true, vis);
                 }
+                // "New to the visible set" = absent from the PREVIOUS build. Such a section has no fresh occlusion
+                // stamp (its box has not been rasterized while it was outside the CPU visible set), so the task
+                // shader must draw it unconditionally this build — otherwise spinning the camera would blank every
+                // newly-entering section for a frame. Its box runs this frame, so the next build uses the stamp.
+                // INVARIANT this rests on: at most one build per frame, and the box pass runs after every build.
+                // Both hold because every trigger (renderLists identity, metaDirty from mirror/freeSection) is
+                // settled in setupTerrain, strictly before the SOLID layer draw that ends with the box pass — so
+                // the TRANSLUCENT beginDraw always takes syncMetadataForDraw's early return. A future mid-frame
+                // upload between the two layers would break it: the build's instances would not be rasterized
+                // until the next frame, and anything it marks isNew=0 with a stale stamp blanks for one frame.
+                s[S_IS_NEW] = (s[S_LAST_BUILD] == this.buildCounter - 1) ? 0 : 1;
+                s[S_LAST_BUILD] = this.buildCounter;
                 this.visibleScratch[vis] = s;
                 this.visibleCenters[vis] = this.translucentCenters.get(key); // null when no per-quad sort data
                 vis++;
@@ -673,8 +886,8 @@ public final class NvidiumBackend {
             MemoryUtil.memPutInt(p + 12, s[3]);
             MemoryUtil.memPutInt(p + 16, s[4]);
             MemoryUtil.memPutInt(p + 20, 0);
-            MemoryUtil.memPutInt(p + 24, 0);
-            MemoryUtil.memPutInt(p + 28, 0);
+            MemoryUtil.memPutInt(p + 24, s[S_VIS_IDX]);
+            MemoryUtil.memPutInt(p + 28, s[S_IS_NEW]);
             item++;
         }
         return item;
@@ -731,8 +944,8 @@ public final class NvidiumBackend {
             MemoryUtil.memPutInt(p + 12, s[3]);
             MemoryUtil.memPutInt(p + 16, s[4]);
             MemoryUtil.memPutInt(p + 20, secSortBase + q0);
-            MemoryUtil.memPutInt(p + 24, 0);
-            MemoryUtil.memPutInt(p + 28, 0);
+            MemoryUtil.memPutInt(p + 24, s[S_VIS_IDX]);
+            MemoryUtil.memPutInt(p + 28, s[S_IS_NEW]);
             item++;
         }
         return item;

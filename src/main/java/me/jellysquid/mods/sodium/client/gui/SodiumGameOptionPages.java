@@ -392,6 +392,13 @@ public class SodiumGameOptionPages {
                         .setBinding((opts, value) -> opts.yumeliumPlus.nvidiumGpuCulling = value, opts -> opts.yumeliumPlus.nvidiumGpuCulling)
                         .setImpact(OptionImpact.LOW)
                         .build())
+                .add(OptionImpl.createBuilder(boolean.class, sodiumOpts)
+                        .setName(new TextComponentTranslation("yumelium.options.nvidium_occlusion_culling.name"))
+                        .setTooltip(new TextComponentTranslation("yumelium.options.nvidium_occlusion_culling.tooltip"))
+                        .setControl(TickBoxControl::new)
+                        .setBinding((opts, value) -> opts.yumeliumPlus.nvidiumOcclusionCulling = value, opts -> opts.yumeliumPlus.nvidiumOcclusionCulling)
+                        .setImpact(OptionImpact.HIGH)
+                        .build())
                 .build());
 
         return new OptionPage(new TextComponentTranslation("yumelium.options.pages.nvidium"), ImmutableList.copyOf(groups));

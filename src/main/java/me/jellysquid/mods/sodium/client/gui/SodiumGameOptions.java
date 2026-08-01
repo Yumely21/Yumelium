@@ -36,6 +36,9 @@ public class SodiumGameOptions {
         // M4a: cull work items on the GPU in a task shader (frustum test against the section AABB) before the mesh
         // stage runs. Read per frame — no renderer reload needed; silently inert when the task stage failed to build.
         public boolean nvidiumGpuCulling = true;
+        // M4b: additionally cull sections the previous frame's depth buffer proved occluded (box-raster visibility).
+        // Default OFF pending in-game verification — it is the one Nvidium path that can pop on fast disocclusion.
+        public boolean nvidiumOcclusionCulling = false;
 
         // Sky / environment
         public boolean renderSky = true;
