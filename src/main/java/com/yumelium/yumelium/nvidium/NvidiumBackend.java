@@ -356,6 +356,8 @@ public final class NvidiumBackend {
         }
         this.readbackSlot = 0;
         this.visIdxSnapshotCount = 0;
+        this.probeSelfTestPending = true; // re-arm: a renderer reload is a fresh end-to-end check
+        this.probeSelfTestSamples = 0;
         this.boxStaging = null;
         this.visBuffer = 0;
         this.visCapacity = 0;
@@ -862,8 +864,16 @@ public final class NvidiumBackend {
 
     // --- M4c: async visibility readback ---------------------------------------------------------------------------
 
-    /** Diagnostic only, so it costs nothing unless the user is actually looking at F3. */
-    private static boolean readbackWanted() {
+    /**
+     * Diagnostic only, so it costs nothing unless the user is actually looking at F3 — with one exception: the
+     * first occlusion frame after init runs it once regardless, so the log records that the whole fenced async path
+     * works end to end. Without that, M4c is only observable by a human holding F3 down and reading a number back,
+     * which made it the one thing in the engine that could not be verified from a log.
+     */
+    private boolean readbackWanted() {
+        if (this.probeSelfTestPending) {
+            return true;
+        }
         try {
             net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getMinecraft();
             return mc != null && mc.gameSettings != null && mc.gameSettings.showDebugInfo;
@@ -871,6 +881,10 @@ public final class NvidiumBackend {
             return false;
         }
     }
+
+    /** Cleared by the first MEANINGFUL completed readback, which logs its result once. Re-armed by {@link #reset()}. */
+    private boolean probeSelfTestPending = true;
+    private int probeSelfTestSamples;
 
     /**
      * Consume any readback slot whose fence has already signalled. Non-blocking by construction: {@code
@@ -958,6 +972,27 @@ public final class NvidiumBackend {
         this.probeTested = tested;
         this.probeOccluded = occluded;
         this.probeLagFrames = bestLag;
+
+        // Wait for a sample worth reading. Firing on the literal first occlusion frame reported "0/1 sections", which
+        // proves the plumbing but says nothing about whether occlusion culling earns its keep — and reads like the
+        // feature does nothing. The counter bounds the wait: without it, a world that never reaches the threshold
+        // would keep readbackWanted() true and pay a buffer copy every frame forever.
+        if (this.probeSelfTestPending && (tested >= 64 || ++this.probeSelfTestSamples >= 300)) {
+            this.probeSelfTestPending = false;
+            // This line is a PLUMBING check, not a measurement: it proves capture → fence → signalled poll →
+            // attributed count all work, once per world load. The lag is the informative field — non-zero means the
+            // fence had not already signalled at capture time, i.e. the readback really is asynchronous; 0 would
+            // mean something is synchronising. A line that never prints means the path is broken.
+            //
+            // The occluded COUNT here is near-meaningless by construction: the earliest sample large enough to log
+            // lands during chunk load, where sections new to the visible set are force-drawn (work-item int 7) and
+            // still carry the sentinel stamp, so they count as visible. Expect ~0. The real figure is the live F3
+            // line during normal play, which is also the only context where "how much does occlusion save" has a
+            // stable answer.
+            log("[M4c] async readback path OK (plumbing check): " + bestLag + " frame(s) of lag, "
+                    + entries + " stamp entries, sample " + occluded + "/" + tested
+                    + " occluded — early-load sample, expect ~0; read F3 during play for the real figure.");
+        }
     }
 
     /**
