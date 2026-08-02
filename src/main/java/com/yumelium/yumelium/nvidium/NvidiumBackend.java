@@ -156,6 +156,7 @@ public final class NvidiumBackend {
                 + (shadersActive ? " (suspended: shaders active)" : "")
                 + (RENDER_TERRAIN ? ", cull: " + (NvidiumRasterizer.instance().gpuCullingActive()
                         ? (NvidiumRasterizer.instance().occlusionCullingActive() ? "gpu-frustum+occlusion" : "gpu-frustum")
+                                + (NvidiumRasterizer.instance().taskStageCulling() ? " (task)" : " (mesh)")
                         : "cpu") : ""));
         list.add(String.format("geometry: %dMB used / %dMB alloc (cap %dMB), resident sections: %d",
                 this.arena == null ? 0 : this.arena.used() >> 20, this.geometryBytes >> 20,

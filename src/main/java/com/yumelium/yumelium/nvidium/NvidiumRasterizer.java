@@ -46,7 +46,7 @@ public final class NvidiumRasterizer {
         final int uWorkItemBase, uAlphaTest, uTranslucent, uSortIndex, uUseSortIndex;
         final int uFogMode, uFogColor, uFogStart, uFogEnd, uFogDensity;
         final int uWorkItemCount, uFrustumPlanes;
-        final int uFrame, uOcclusionEnabled, uNearRadiusSq;
+        final int uFrame, uOcclusionEnabled, uNearRadiusSq, uCullEnabled, uDiagTerms;
 
         Uniforms(int id) {
             this.uProj = GL20C.glGetUniformLocation(id, "u_Proj");
@@ -72,6 +72,8 @@ public final class NvidiumRasterizer {
             this.uFrame = GL20C.glGetUniformLocation(id, "u_Frame");
             this.uOcclusionEnabled = GL20C.glGetUniformLocation(id, "u_OcclusionEnabled");
             this.uNearRadiusSq = GL20C.glGetUniformLocation(id, "u_NearRadiusSq");
+            this.uCullEnabled = GL20C.glGetUniformLocation(id, "u_CullEnabled");
+            this.uDiagTerms = GL20C.glGetUniformLocation(id, "u_DiagTerms");
         }
     }
 
@@ -83,12 +85,20 @@ public final class NvidiumRasterizer {
      * in — and close-range popping is the most visible failure there is. */
     private static final float NEAR_ALWAYS_VISIBLE = 48.0F;
 
+    /** TEMP DIAGNOSTIC (2026-08-01, black distant leaves): false-colour which factor of the shaded product is
+     * degenerate — RED lightmap, BLUE atlas sample, GREEN vertex colour, YELLOW vertex alpha (AO), WHITE all fine
+     * (so the darkening is the fog blend). Answered 2026-08-01: BLUE — the atlas sample itself, in BOTH backends,
+     * which pointed at MC's mipmap generation (see MixinTextureUtilMipmap). Left in for the next such hunt. */
+    private static final boolean DIAG_TERMS = false;
+
     private MeshRasterProgram program;         // mesh-only — the proven M3b path and the permanent fallback
     private MeshRasterProgram programCulled;   // task+mesh — null when the task stage failed to build (M4a)
     private Uniforms uniforms;
     private Uniforms uniformsCulled;
     private Uniforms active;
     private boolean gpuCullActive;
+    /** Whether the cull runs in the TASK stage (vs inside the mesh shader) — drives the dispatch shape and F3. */
+    private boolean taskCullActive;
     // M4b: the box-raster occlusion pass. Its own program (vertex+fragment), its own empty VAO (the boxes are
     // generated from gl_VertexID/gl_InstanceID — binding an empty VAO stops whatever attribute arrays the previous
     // draw left enabled from being fetched), and a frame clock the stamps are compared against.
@@ -126,6 +136,11 @@ public final class NvidiumRasterizer {
     /** @return whether the LAST beginDraw also applied the box-raster occlusion test (F3 diagnostics). */
     public boolean occlusionCullingActive() {
         return this.occlusionActive;
+    }
+
+    /** @return whether culling ran in the task stage rather than inside the mesh shader (F3 diagnostics). */
+    public boolean taskStageCulling() {
+        return this.taskCullActive;
     }
 
     private static boolean optionGpuCulling() {
@@ -203,9 +218,13 @@ public final class NvidiumRasterizer {
             return false;
         }
 
-        this.gpuCullActive = this.programCulled != null && optionGpuCulling();
-        MeshRasterProgram prog = this.gpuCullActive ? this.programCulled : this.program;
-        this.active = this.gpuCullActive ? this.uniformsCulled : this.uniforms;
+        // GPU culling runs either in the task stage (one dispatch per 32 items, survivors launched as mesh children)
+        // or, when the driver rejects the task shader, inside the mesh shader itself (culled workgroups emit zero
+        // primitives). Same test, same AABB — only the dispatch shape and the saved workgroup launch differ.
+        this.gpuCullActive = optionGpuCulling();
+        this.taskCullActive = this.gpuCullActive && this.programCulled != null;
+        MeshRasterProgram prog = this.taskCullActive ? this.programCulled : this.program;
+        this.active = this.taskCullActive ? this.uniformsCulled : this.uniforms;
         prog.bind();
 
         projection.get(this.matrixBuffer);
@@ -224,6 +243,7 @@ public final class NvidiumRasterizer {
 
         GL20C.glUniform1i(this.active.uBlockTex, 0);
         GL20C.glUniform1i(this.active.uLightTex, 1);
+        GL20C.glUniform1i(this.active.uDiagTerms, DIAG_TERMS ? 1 : 0);
         NVShaderBufferLoad.glUniformui64NV(this.active.uWorkItems, backend.metadataAddress());
         NVShaderBufferLoad.glUniformui64NV(this.active.uGeometry, backend.geometryAddress());
         NVShaderBufferLoad.glUniformui64NV(this.active.uSortIndex, backend.sortIndexAddress());
@@ -260,6 +280,8 @@ public final class NvidiumRasterizer {
             this.frustumBuffer.flip();
             GL20C.glUniform4fv(this.active.uFrustumPlanes, this.frustumBuffer);
         }
+        // Only the mesh-side variant declares this; on the tasked program the location is -1 and the call no-ops.
+        GL20C.glUniform1i(this.active.uCullEnabled, this.gpuCullActive && !this.taskCullActive ? 1 : 0);
 
         // M4b occlusion: the task shader compares each section's stamp against the current frame. The stamps come
         // from the box pass at the end of the opaque draw, so the SOLID/CUTOUT passes read frame-1 data (hysteresis
@@ -364,8 +386,9 @@ public final class NvidiumRasterizer {
         GL20C.glUniform1i(this.active.uAlphaTest, alphaTest);
         GL20C.glUniform1i(this.active.uTranslucent, translucent);
         GL20C.glUniform1i(this.active.uWorkItemCount, count);
-        // GPU culling: one TASK workgroup covers 32 work items and launches only the survivors as mesh children.
-        NVMeshShader.glDrawMeshTasksNV(0, this.gpuCullActive ? (count + 31) / 32 : count);
+        // With the task stage: one TASK workgroup per 32 work items, survivors launched as mesh children. Without
+        // it: one mesh workgroup per work item as always (the mesh shader culls itself).
+        NVMeshShader.glDrawMeshTasksNV(0, this.taskCullActive ? (count + 31) / 32 : count);
     }
 
     /** Draws the solid + cutout passes (opaque). @return true if it handled the pass (skip vanilla). */
@@ -521,8 +544,25 @@ public final class NvidiumRasterizer {
             "uniform ivec3 u_CameraBlock;\n" +
             "uniform vec3 u_CameraFrac;\n" +
             "uniform int u_WorkItemBase;\n" +
-            (tasked ? "taskNV in Task { uint itemIdx[32]; } IN;\n" : "") +
-            "layout(location = 0) out VertexData { vec4 color; vec2 uv; vec2 lightUV; float desaturate; float fragDist; } v_out[];\n" +
+            (tasked ? "taskNV in Task { uint itemIdx[32]; } IN;\n"
+                    // Mesh-side culling: the same frustum + occlusion test the task shader does, run per WORKGROUP
+                    // instead of per task lane. Used whenever the task stage is unavailable — NVIDIA's shader
+                    // compiler rejects our task shader on some drivers with an internal assembly error, and without
+                    // this the whole GPU-culling feature would be dormant there. A culled workgroup emits zero
+                    // primitives, so everything after the test (128 vertex decodes + rasterization) is skipped; only
+                    // the workgroup launch itself remains, which is what the task stage would have saved on top.
+                    : "uniform vec4 u_FrustumPlanes[6];\n"
+                    + "uniform int u_CullEnabled;\n"
+                    + "layout(std430, binding = 0) readonly buffer Visibility { uint stamps[]; };\n"
+                    + "uniform uint u_Frame;\n"
+                    + "uniform int u_OcclusionEnabled;\n"
+                    + "uniform float u_NearRadiusSq;\n") +
+            // Same table as sodium's include/chunk_material.glsl — the fragment must reproduce Sodium's per-material
+            // sampling exactly or the two backends disagree on foliage (see the mipBias note below).
+            "const float ALPHA_CUTOFF[4] = float[4](0.0, 0.1, 0.5, 1.0);\n" +
+            "uniform sampler2D u_LightTex;\n" +
+            "layout(location = 0) out VertexData { vec4 color; vec2 uv; vec3 light; float desaturate;"
+                    + " float fragDist; float mipBias; float alphaCutoff; } v_out[];\n" +
             "void main() {\n" +
             (tasked
                 ? "    int wi = (u_WorkItemBase + int(IN.itemIdx[gl_WorkGroupID.x])) * 8;\n"
@@ -532,6 +572,28 @@ public final class NvidiumRasterizer {
             "    ivec3 origin = ivec3(u_WorkItems[wi + 2], u_WorkItems[wi + 3], u_WorkItems[wi + 4]);\n" +
             "    int sortOffset = u_WorkItems[wi + 5];\n" +
             "    vec3 sectionRel = vec3(origin - u_CameraBlock) - u_CameraFrac;\n" +
+            (tasked ? ""
+                    : "    if (u_CullEnabled == 1) {\n"
+                    + "        vec3 lo = sectionRel - vec3(8.0);\n"   // decode range is -8..+24 around the origin
+                    + "        vec3 hi = lo + vec3(32.0);\n"
+                    + "        bool visible = true;\n"
+                    + "        for (int p = 0; p < 6 && visible; p++) {\n"
+                    + "            vec4 pl = u_FrustumPlanes[p];\n"
+                    + "            vec3 v = mix(lo, hi, greaterThan(pl.xyz, vec3(0.0)));\n" // positive vertex
+                    + "            visible = dot(pl.xyz, v) + pl.w >= 0.0;\n"
+                    + "        }\n"
+                    + "        if (visible && u_OcclusionEnabled == 1 && u_WorkItems[wi + 7] == 0) {\n"
+                    + "            vec3 c = sectionRel + vec3(8.0);\n" // section centre, camera-relative
+                    + "            if (dot(c, c) > u_NearRadiusSq) {\n"
+                    + "                uint stamp = stamps[u_WorkItems[wi + 6]];\n"
+                    + "                visible = (stamp == 0u) || (u_Frame - stamp <= 2u);\n"
+                    + "            }\n"
+                    + "        }\n"
+                    + "        if (!visible) {\n"
+                    + "            if (gl_LocalInvocationID.x == 0u) { gl_PrimitiveCountNV = 0u; }\n"
+                    + "            return;\n"
+                    + "        }\n"
+                    + "    }\n") +
             "    mat4 mvp = u_Proj * u_ModelView;\n" +
             "    uint q = gl_LocalInvocationID.x;\n" +
             "    if (q < uint(numQuads)) {\n" +
@@ -552,12 +614,29 @@ public final class NvidiumRasterizer {
             "            vec2 lc = vec2(float(w4 & 0xFFFFu), float(w4 >> 16));\n" +
             "            uint material = (w1 >> 16) & 0xFFu;\n" + // byte 6 = material flags
             "            float desat = ((material >> 3u) & 1u) != 0u ? 1.0 : 0.0;\n" + // bit 3 = desaturate (water)
+            // Atlas LOD bias — sodium's _material_mip_bias, bit for bit. Non-mipped materials (the CUTOUT layer:
+            // grass, crops, plants) sample far down the mip chain because MC's atlas mips average the transparent
+            // BLACK texels surrounding a cutout sprite into the visible ones; without this they darken at grazing
+            // angles (2026-08-01). NOTE the bias is ADDED to the derivative LOD — it is not a level clamp.
+            "            uint cutoffIdx = (material >> 1u) & 3u;\n" +
+            "            float mipBias = ((material >> 0u) & 1u) != 0u ? 0.0 : -4.0;\n" +
+            // bits 1-2 = alpha cutoff index; CUTOUT is 0.1, not the 0.5 this shader used to hardcode.
+            "            float alphaCut = ALPHA_CUTOFF[cutoffIdx];\n" +
             "            uint o = q * 4u + v;\n" +
             "            gl_MeshVerticesNV[o].gl_Position = mvp * vec4(pos, 1.0);\n" +
             "            v_out[o].color = col;\n" +
             "            v_out[o].uv = uv;\n" +
-            "            v_out[o].lightUV = clamp(lc / 256.0, vec2(0.5 / 16.0), vec2(15.5 / 16.0));\n" +
+            // Sample the lightmap HERE, per vertex, and interpolate the resulting colour — exactly what sodium's
+            // block_layer_opaque.vsh does. Interpolating the COORDINATE and fetching per fragment (what this shader
+            // used to do) is not equivalent: MC binds the lightmap with legacy GL_CLAMP, whose border is BLACK, and
+            // this clamp range is the outermost texel CENTRES, i.e. zero margin. Outdoor terrain sits exactly on the
+            // lower bound (blocklight 0), so any interpolation undershoot — which distant foliage, a mass of thin
+            // sub-pixel triangles, is precisely the geometry to produce — blends that black border straight into the
+            // light term. Leaves going black with distance while Sodium stayed correct (2026-08-01).
+            "            v_out[o].light = texture(u_LightTex, clamp(lc / 256.0, vec2(0.5 / 16.0), vec2(15.5 / 16.0))).rgb;\n" +
             "            v_out[o].desaturate = desat;\n" +
+            "            v_out[o].mipBias = mipBias;\n" +
+            "            v_out[o].alphaCutoff = alphaCut;\n" +
             // pos is already camera-relative → spherical frag distance, same as Sodium's getFragDistance(SPHERICAL).
             "            v_out[o].fragDist = length(pos);\n" +
             "        }\n" +
@@ -615,9 +694,9 @@ public final class NvidiumRasterizer {
 
     private static final String FRAG_SRC =
             "#version 460\n" +
-            "layout(location = 0) in VertexData { vec4 color; vec2 uv; vec2 lightUV; float desaturate; float fragDist; } v_in;\n" +
+            "layout(location = 0) in VertexData { vec4 color; vec2 uv; vec3 light; float desaturate;"
+                    + " float fragDist; float mipBias; float alphaCutoff; } v_in;\n" +
             "uniform sampler2D u_BlockTex;\n" +
-            "uniform sampler2D u_LightTex;\n" +
             "uniform int u_AlphaTest;\n" +
             "uniform int u_Translucent;\n" +
             "uniform int u_FogMode;\n" + // 0 = none, 1 = EXP2 (water/lava), 2 = LINEAR (atmospheric)
@@ -625,10 +704,17 @@ public final class NvidiumRasterizer {
             "uniform float u_FogStart;\n" +
             "uniform float u_FogEnd;\n" +
             "uniform float u_FogDensity;\n" +
+            "uniform int u_DiagTerms;\n" +
             "out vec4 fragColor;\n" +
             "void main() {\n" +
-            "    vec4 tex = texture(u_BlockTex, v_in.uv);\n" +
-            "    if (u_AlphaTest == 1 && tex.a < 0.5) { discard; }\n" +
+            // Alpha-tested foliage samples the BASE level explicitly. textureLod is a hard level select; the mip
+            // BIAS used before is only added to the derivative LOD, so it never actually pinned the level — distant
+            // leaves still landed several mips down, where the atlas's transparent surroundings blend into the
+            // sprite and turn it black. Solid/translucent keep normal mipmapping (no transparent neighbours to
+            // bleed). Trade-off: distant foliage aliases like "Mipmap Levels: OFF" does (2026-08-01).
+            "    vec4 tex = (v_in.alphaCutoff > 0.0) ? textureLod(u_BlockTex, v_in.uv, 0.0)\n" +
+            "                                       : texture(u_BlockTex, v_in.uv, v_in.mipBias);\n" +
+            "    if (u_AlphaTest == 1 && tex.a < v_in.alphaCutoff) { discard; }\n" +
             // Water desaturate (match Sodium's block_layer_opaque): grayscale the texture so the biome vertex colour
             // sets the hue → the calmer per-biome water instead of the raw vivid-blue texture.
             "    if (v_in.desaturate > 0.5) {\n" +
@@ -636,8 +722,20 @@ public final class NvidiumRasterizer {
             "        float t = clamp((luma - 0.29) / 0.18, 0.0, 1.0);\n" +
             "        tex.rgb = vec3(0.65 + t * 0.35);\n" +
             "    }\n" +
-            "    vec3 light = texture(u_LightTex, v_in.lightUV).rgb;\n" +
-            "    vec3 rgb = tex.rgb * v_in.color.rgb * light * v_in.color.a;\n" +
+            "    vec3 rgb = tex.rgb * v_in.color.rgb * v_in.light * v_in.color.a;\n" +
+            // DIAGNOSTIC (u_DiagTerms=1): false-colour which FACTOR of the product above is degenerate, so a single
+            // look at the affected geometry names the culprit instead of another round of guessing. Runs before fog
+            // and returns, so WHITE means the shaded colour is fine and the darkening must come from the fog blend.
+            "    if (u_DiagTerms == 1) {\n" +
+            "        vec3 dbg = vec3(0.0);\n" +
+            "        if (max(max(v_in.light.r, v_in.light.g), v_in.light.b) < 0.05) dbg.r = 1.0;\n" +      // RED   = lightmap
+            "        if (max(max(tex.r, tex.g), tex.b) < 0.05) dbg.b = 1.0;\n" +                          // BLUE  = atlas sample
+            "        if (max(max(v_in.color.r, v_in.color.g), v_in.color.b) < 0.05) dbg.g = 1.0;\n" +     // GREEN = vertex colour
+            "        if (v_in.color.a < 0.05) dbg = vec3(1.0, 1.0, 0.0);\n" +                             // YELLOW= vertex alpha (AO)
+            "        if (dbg == vec3(0.0)) dbg = vec3(1.0);\n" +                                          // WHITE = all fine -> fog
+            "        fragColor = vec4(dbg, 1.0);\n" +
+            "        return;\n" +
+            "    }\n" +
             // Fog emulation — formulas copied from assets/sodium/shaders/include/fog.glsl (_exp2Fog / _linearFog),
             // arg order and all: EXP2 mixes (fog → frag), LINEAR mixes (frag → fog). Fragment alpha stays untouched.
             "    if (u_FogMode == 1) {\n" +
@@ -648,7 +746,10 @@ public final class NvidiumRasterizer {
             "        float f = v_in.fragDist < u_FogEnd ? smoothstep(u_FogStart, u_FogEnd, v_in.fragDist) : 1.0;\n" +
             "        rgb = mix(rgb, u_FogColor.rgb, f * u_FogColor.a);\n" +
             "    }\n" +
-            "    float a = (u_Translucent == 1) ? tex.a : 1.0;\n" +
-            "    fragColor = vec4(rgb, a);\n" +
+            // Output the REAL texture alpha, as sodium's block_layer_opaque.fsh does. (This is cosmetic parity, not
+            // a filter: vanilla runs disableAlpha() around the SOLID layer call that both backends draw solid AND
+            // cutout inside, so the fixed-function alpha test is OFF here — the shader discard above is the only
+            // cutout gate. Blending is off too, so the framebuffer alpha is otherwise unused.)
+            "    fragColor = vec4(rgb, tex.a);\n" +
             "}\n";
 }
