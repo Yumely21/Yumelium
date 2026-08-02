@@ -69,6 +69,12 @@ public class YumeliumDebugOverlay {
                         casters, (int) IrisPipeline.shadowDistanceBlocks() + 16));
                 event.getLeft().add(String.format("%s[%s] Culling: camera %d/%d sections | shadow: camera-visible set + shadow box + underground (voxel volume exempt)",
                         COLOR, SHADER_BRAND, renderer.getVisibleSectionCount(), renderer.getTotalSectionCount()));
+                // Leash gate (see MixinRenderLivingLeashIris): "skipped" is the number of living entities that no
+                // longer pay a full program switch each way for a leash they do not have. It should track the mob
+                // count, and "run" should stay 0 until something is actually leashed.
+                event.getLeft().add(String.format("%s[%s] Basic brackets: %d run / %d skipped (leash gate %s)",
+                        COLOR, SHADER_BRAND, pipeline.basicBracketsRun(), pipeline.basicBracketsSkipped(),
+                        IrisPipeline.LEASH_GATE ? "on" : "OFF"));
             }
         } else {
             event.getLeft().add(COLOR + "[" + SHADER_BRAND + "] Shaders: Disabled");

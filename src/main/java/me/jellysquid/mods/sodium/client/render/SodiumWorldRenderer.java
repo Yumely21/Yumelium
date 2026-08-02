@@ -409,11 +409,19 @@ public class SodiumWorldRenderer {
         // them at every ENTITY_SHADOW value) — at ENTITY_SHADOW=-1 + PLAYER_SHADOW=-1 the pack emits both entity
         // flags false, and gating only on them silently killed the TESR loop nested inside (2026-07-27 audit).
         if (iris$entityCasters || com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().shadowBlockEntitiesEnabled()) {
+            // Split the entity casters out of the enclosing "shadow" phase, which spans terrain + entities + TESRs —
+            // without this, entity caster cost is not separable from terrain cost and any estimate of an entity-side
+            // optimisation is a guess. It must be a SWITCH, not a nested begin: GL_TIME_ELAPSED queries cannot nest
+            // and GpuProfiler.begin() silently ignores a nested call, so a plain begin here would measure nothing at
+            // all. Re-entering "shadow" afterwards is fine — the profiler sums repeated phases within a frame.
+            com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().profileSwitch("shadow_entities");
             try {
                 drawEntityShadowCasters(matrices, x, y, z, iris$allEntities, iris$entityCasters);
             } catch (Throwable t) {
                 SodiumClientMod.logger().warn("[Iris shadow] entity shadow pass failed this frame", t);
             } finally {
+                // Back to the enclosing phase for the snapshot + translucent casters below.
+                com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().profileSwitch("shadow");
                 // The snapshot + translucent layer below need the shadow FBO healthy no matter what an entity
                 // renderer (or a hook) did to its binding/attachments mid-loop.
                 com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().reassertShadowFboState();

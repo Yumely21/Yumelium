@@ -1091,6 +1091,17 @@ public final class IrisPipeline {
 
     /** GPU wall-clock per phase — the only honest way to pick what to optimise. See GpuProfiler. */
     private final com.yumelium.yumelium.shaders.gl.GpuProfiler profiler = new com.yumelium.yumelium.shaders.gl.GpuProfiler();
+
+    /**
+     * Close the phase currently being timed and open {@code name}. The ONLY way to sub-divide a phase: GL_TIME_ELAPSED
+     * queries cannot nest, and {@link com.yumelium.yumelium.shaders.gl.GpuProfiler#begin} silently ignores a nested
+     * call — so a plain begin inside a live phase measures nothing and looks like the phase costs zero. Re-entering a
+     * name later in the same frame is fine; the profiler sums repeated phases per frame.
+     */
+    public void profileSwitch(String name) {
+        this.profiler.end();
+        this.profiler.begin(name);
+    }
     // Logs the GPU time breakdown (shadow / gbuffers / composite) once a second. Cheap: the queries are read back several
     // frames late, so nothing stalls. Off for clean logs; flip on when profiling where the frame time actually goes.
     private static final boolean DIAG_GPU_TIME = false;
@@ -3785,6 +3796,27 @@ public final class IrisPipeline {
      * with whatever texel was left) and the BLOCK SELECTION OUTLINE (standalone, no pass active). The pack's basic is
      * the classic ftransform+glColor program, fully compatible with these fixed-function draws.
      */
+    /** Kill switch for the leash-bracket gate (MixinRenderLivingLeashIris). Flip false to restore the old
+     * unconditional bracket if a pack or mod ever turns out to depend on the per-entity program churn. */
+    public static final boolean LEASH_GATE = true;
+
+    /** Per-frame counters for the leash gate, surfaced on F3 so the saving is measurable in one build: with the gate
+     * working, "skipped" tracks the living-entity count and "run" stays 0 until something is actually leashed. */
+    private int basicBracketsRun;
+    private int basicBracketsSkipped;
+
+    public void countBasicBracketSkipped() {
+        this.basicBracketsSkipped++;
+    }
+
+    public int basicBracketsRun() {
+        return this.basicBracketsRun;
+    }
+
+    public int basicBracketsSkipped() {
+        return this.basicBracketsSkipped;
+    }
+
     public void beginBasic() {
         // The shadowPass guard is LOAD-BEARING: the leash mixin fires for EVERY EntityLiving (renderLeash itself
         // early-returns without a leash holder, but the HEAD/RETURN hooks run regardless), so during the entity
@@ -3798,6 +3830,7 @@ public final class IrisPipeline {
             return;
         }
         this.basicActive = true;
+        this.basicBracketsRun++;
         useItemLitProgram(this.basicProgram);
         if (NORMAL_GBUFFER_ENABLED && this.targets != null && this.basicTargets != null) {
             this.targets.beginTargets(this.basicTargets, blendOffFor("gbuffers_basic"));
@@ -5487,6 +5520,8 @@ public final class IrisPipeline {
             // per frame here, before anything that reads the shadow box (computeShadowMatrices, the section culls,
             // updateShadowRenderList, the entity caster radius) runs later in the same frame.
             refreshPackShadowGeometry();
+            this.basicBracketsRun = 0;      // leash-gate counters are per FRAME (F3 diagnostics)
+            this.basicBracketsSkipped = 0;
             this.targets.resize(w, h);
 
             EntityRenderer er = mc.entityRenderer;
