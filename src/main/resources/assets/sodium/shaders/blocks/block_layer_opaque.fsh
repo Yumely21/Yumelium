@@ -28,7 +28,17 @@ uniform float u_FogDensity; // The density of the shader fog
 out vec4 fragColor; // The output fragment for the color framebuffer
 
 void main() {
+    // yumelium: the alpha-tested pass (grass, leaves, plants) samples the BASE level explicitly. A mip BIAS is only
+    // added to the derivative-computed LOD, so it cannot pin the level — distant foliage still resolved several
+    // mips down, where MC's atlas blends a sprite with the transparent BLACK around it and the leaf goes black
+    // (2026-08-01: false-colouring the terrain fragment showed the atlas SAMPLE itself returning black, in both the
+    // Sodium and the Nvidium backend). Solid/translucent geometry keeps real mipmapping — no transparent
+    // neighbours to bleed in. Trade-off: distant foliage aliases as it would with "Mipmap Levels: OFF".
+#ifdef USE_FRAGMENT_DISCARD
+    vec4 diffuseColor = textureLod(u_BlockTex, v_TexCoord, 0.0);
+#else
     vec4 diffuseColor = texture(u_BlockTex, v_TexCoord, v_MaterialMipBias);
+#endif
 
 #ifdef USE_FRAGMENT_DISCARD
     if (diffuseColor.a < v_MaterialAlphaCutoff) {

@@ -4,7 +4,8 @@
   "compatibilityLevel": "JAVA_8",
   "target": "@env(DEFAULT)",
   "client": [
-    "MixinEntityRendererCameraClip"
+    "MixinEntityRendererCameraClip",
+    "MixinTextureUtilMipmap"
   ],
   "mixins": [],
   "server": [],
