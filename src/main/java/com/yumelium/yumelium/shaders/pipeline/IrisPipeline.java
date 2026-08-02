@@ -997,9 +997,10 @@ public final class IrisPipeline {
         return this.targets == null ? 0 : this.targets.shadowSize();
     }
 
-    /** @return the pack's radial shadow distortion bias (F3 debug). */
+    /** @return the pack's radial shadow distortion bias (F3 debug) — the LIVE value the entity shadow program uses,
+     * so a mismatch against the pack is visible in F3 rather than only on screen. */
     public float shadowMapBias() {
-        return SHADOW_MAP_BIAS;
+        return this.shadowMapBiasThisFrame;
     }
 
     /** Re-establishes the shadow FBO's binding/attachments/drawBuffers/viewport mid-pass (no clear) — called by the
@@ -1011,12 +1012,20 @@ public final class IrisPipeline {
         }
     }
 
-    /** Binds the distortion-matching player-shadow program (diffuse on unit 0) for the fixed-function entity render. */
+    /** Binds the distortion-matching player-shadow program (diffuse on unit 0) for the fixed-function entity render.
+     * The bias MUST come from the pack's live shadowDistance, not the built-in profile constant — see
+     * {@link #packShadowMapBias()}; a mismatch here is what puts entity shadows in the wrong place at the wrong size
+     * while terrain shadows stay correct. Cached per shadow pass by {@link #renderShadowPass}. */
     public void usePlayerShadowProgram() {
         this.playerShadowProgram.use();
         this.playerShadowProgram.setInt("tex", 0);
-        this.playerShadowProgram.setFloat("shadowMapBias", SHADOW_MAP_BIAS);
+        this.playerShadowProgram.setFloat("shadowMapBias", this.shadowMapBiasThisFrame);
     }
+
+    /** {@link #packShadowMapBias()} sampled once per shadow pass — usePlayerShadowProgram runs per caster, and the
+     * option lookup is a map get + parse. Initialised to the built-in profile so a draw before the first shadow pass
+     * (or with no pack options loaded) behaves exactly as before. */
+    private float shadowMapBiasThisFrame = SHADOW_MAP_BIAS;
 
     private final Matrix4f shadowProjection = new Matrix4f();
     private final Matrix4f shadowModelView = new Matrix4f();
@@ -3202,6 +3211,44 @@ public final class IrisPipeline {
         } catch (NumberFormatException e) {
             return fallback;
         }
+    }
+
+    private static float floatOption(ShaderOptionSet opts, String name, float fallback) {
+        try {
+            String v = opts.optionValue(name);
+            return v == null ? fallback : Float.parseFloat(v.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    /**
+     * The pack's live {@code shadowDistance} option, which drives its {@code const float shadowMapBias = 1.0 - 25.6 /
+     * shadowDistance}. Read per frame rather than baked in: it is a user-facing slider in the shader options screen,
+     * and {@link #SHADOW_DISTANCE} was hardcoded to one profile's value (192) — with the slider at anything else, the
+     * entity shadow program distorted with a bias the pack's own lookup did not agree with. See
+     * {@link #packShadowMapBias()}.
+     */
+    private float packShadowDistance() {
+        return floatOption(shaderOptions(), "shadowDistance", SHADOW_DISTANCE);
+    }
+
+    /**
+     * The pack's radial shadow distortion bias, derived from ITS shadowDistance.
+     *
+     * <p>Everything on the terrain path — the write (the pack's own shadow vertex, via TerrainShaderTransformer) and
+     * the read (the pack's GetShadowPos in deferred/composite) — uses the pack's own const, so terrain shadows are
+     * self-consistent whatever the slider says. The ONE place that has to reproduce it host-side is the hand-written
+     * entity/player shadow program, which re-applies the distortion manually. Feeding it the 192-profile constant
+     * while the pack computed 128 made entity shadows land offset and at the wrong scale against correct terrain
+     * shadows (reported 2026-08-02; the option file had been changed to shadowDistance=128 the previous evening).
+     */
+    private float packShadowMapBias() {
+        float d = packShadowDistance();
+        if (!(d > 25.6F)) {
+            return SHADOW_MAP_BIAS; // nonsensical/degenerate slider value — keep the built-in profile
+        }
+        return 1.0F - 25.6F / d;
     }
 
     /**
@@ -5399,6 +5446,11 @@ public final class IrisPipeline {
             this.targets.setCustomTextures(this.noisePngData, this.waterNormalPngData);
             // Match the shadow map size to the pack's shadowMapResolution const (god rays sample it by explicit texel index).
             this.targets.setShadowSize(packShadowMapResolution());
+            // Same reason as the shadow-map resolution above: shadowDistance is a live slider in the shader options
+            // screen and it drives the pack's shadow distortion bias. Sampled ONCE per frame — the two consumers
+            // (applyTerrainUniforms, usePlayerShadowProgram) run per draw and per caster respectively, and the lookup
+            // is a map get + parse. Both must agree with the pack or shadows land offset, radially about the camera.
+            this.shadowMapBiasThisFrame = packShadowMapBias();
             this.targets.resize(w, h);
 
             EntityRenderer er = mc.entityRenderer;
@@ -6950,7 +7002,7 @@ public final class IrisPipeline {
         // Shadow-pass vertex distortion controls (see TerrainShaderTransformer): warp on only while rendering the shadow
         // map, with the pack's exact bias so the stored depths match the terrain lookup's distorted coords.
         program.setFloat("iris_shadowPass", this.shadowPass ? 1.0F : 0.0F);
-        program.setFloat("iris_shadowMapBias", SHADOW_MAP_BIAS);
+        program.setFloat("iris_shadowMapBias", this.shadowMapBiasThisFrame);
         // renderStage: the pack's voxelizers gate on it. UpdateVoxelMap (colored lighting) wants any TERRAIN stage — left
         // unset (0 = NONE) nothing voxelized at all. But UpdateSceneVoxelMap (the WSR volume) accepts ONLY
         // SOLID/CUTOUT/CUTOUT_MIPPED, and UpdatePuddleVoxelMap accepts ONLY TRANSLUCENT — so the stage must be HONEST per
