@@ -345,6 +345,18 @@ public class SodiumGameOptions {
                 config = new SodiumGameOptions();
                 resaveConfig = false;
             }
+            if (config == null) {
+                // An EMPTY (or whitespace-only) file makes Gson return null rather than throw, so neither catch above
+                // sees it and `config.configPath = path` below was an NPE — the game failed to start, with a stack
+                // trace pointing at config loading rather than at the real cause. Reachable from a crash or a full
+                // disk during writeChanges, or from hand-editing.
+                //
+                // Unlike the malformed-JSON path this one DOES resave: that branch keeps resaveConfig false to
+                // preserve a file the user might still want to recover settings from, and an empty file has nothing
+                // to preserve. Rewriting it with defaults lets the config self-repair.
+                SodiumClientMod.logger().error("Config file {} is empty; falling back to default settings", path);
+                config = new SodiumGameOptions();
+            }
         } else {
             config = new SodiumGameOptions();
         }

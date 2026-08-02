@@ -91,9 +91,16 @@ public abstract class BakedQuadMixin implements BakedQuadView {
     @Unique
     private ModelQuadFacing embeddium$normalFace;
 
+    // require = 1: this is the load-bearing injector of the whole meshing path, and its failure mode is SILENT.
+    // Without it embeddium$stride stays 0, so embeddium$base(idx) returns 0 for every vertex, all four vertices read
+    // vertex 0, and every quad is a zero-area degenerate — terrain simply stops appearing, with nothing in the log.
+    // That risk is not theoretical here: this class already carries a documented dev-vs-production divergence
+    // (getSprite() must stay an unannotated method because FermiumASM's squashBakedQuads strips it from BakedQuad in
+    // production), i.e. production is exactly where a targeting change would first bite. Fail loudly instead.
     @Inject(
             method = "<init>([IILnet/minecraft/util/EnumFacing;Lnet/minecraft/client/renderer/texture/TextureAtlasSprite;ZLnet/minecraft/client/renderer/vertex/VertexFormat;)V",
-            at = @At("RETURN")
+            at = @At("RETURN"),
+            require = 1
     )
     private void embeddium$init(int[] vertexData, int tintIndex, EnumFacing face, TextureAtlasSprite sprite,
                                 boolean applyDiffuseLighting, VertexFormat format, CallbackInfo ci) {
