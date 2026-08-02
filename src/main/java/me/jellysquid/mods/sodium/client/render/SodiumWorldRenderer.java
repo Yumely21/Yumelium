@@ -415,11 +415,13 @@ public class SodiumWorldRenderer {
             // and GpuProfiler.begin() silently ignores a nested call, so a plain begin here would measure nothing at
             // all. Re-entering "shadow" afterwards is fine — the profiler sums repeated phases within a frame.
             com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().profileSwitch("shadow_entities");
+            final long iris$cpuStart = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().entityCpuMark();
             try {
                 drawEntityShadowCasters(matrices, x, y, z, iris$allEntities, iris$entityCasters);
             } catch (Throwable t) {
                 SodiumClientMod.logger().warn("[Iris shadow] entity shadow pass failed this frame", t);
             } finally {
+                com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().addShadowEntityCpu(iris$cpuStart);
                 // Back to the enclosing phase for the snapshot + translucent casters below.
                 com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().profileSwitch("shadow");
                 // The snapshot + translucent layer below need the shadow FBO healthy no matter what an entity
@@ -507,6 +509,9 @@ public class SodiumWorldRenderer {
         }
         float partialTicks = mc.getRenderPartialTicks();
         RenderManager renderManager = mc.getRenderManager();
+        // DIAGNOSTIC: split this pass's CPU cost into setup / draws / TESR sweep — it measured ~7 ms while drawing a
+        // single entity for 0.00 ms of GPU, and did not move with the entity count.
+        final long iris$tSetup = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().entityCpuMark();
 
         // Light-POV fixed-function matrices; the distortion program warps on top of them.
         GlStateManager.matrixMode(GL11.GL_PROJECTION);
@@ -543,6 +548,8 @@ public class SodiumWorldRenderer {
         GlStateManager.enableAlpha();
 
         com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().usePlayerShadowProgram();
+        com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().addShadowEntSetup(iris$tSetup);
+        final long iris$tDraw = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().entityCpuMark();
         boolean logNow = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.DIAG_ENTITY_SHADOW
                 && ++this.iris$entShadowLogTick % 60 == 0;
         try {
@@ -676,6 +683,8 @@ public class SodiumWorldRenderer {
             // portal/gateway (surface flush with the ground casts nothing visible, and the vanilla fallback is a
             // TEXGEN multi-pass that manhandles the texture matrix mid-shadow-pass). Forge fast-only TESRs draw
             // nothing through the plain render() path and simply don't cast.
+            com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().addShadowEntDraw(iris$tDraw);
+            final long iris$tTesr = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().entityCpuMark();
             if (com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().shadowBlockEntitiesEnabled()
                     && net.minecraft.client.renderer.tileentity.TileEntityRendererDispatcher.instance.world != null) {
                 net.minecraft.client.renderer.tileentity.TileEntityRendererDispatcher dispatcher =
@@ -731,6 +740,7 @@ public class SodiumWorldRenderer {
                 this.iris$shadowTesrDrawn = drawnTe;
                 this.iris$shadowTesrFailed = failedTe;
             }
+            com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().addShadowEntTesr(iris$tTesr);
         } finally {
             com.yumelium.yumelium.shaders.gl.GlslProgram.unuse();
             net.minecraft.client.renderer.RenderHelper.disableStandardItemLighting();

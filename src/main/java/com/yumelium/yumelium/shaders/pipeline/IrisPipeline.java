@@ -1104,7 +1104,74 @@ public final class IrisPipeline {
     }
     // Logs the GPU time breakdown (shadow / gbuffers / composite) once a second. Cheap: the queries are read back several
     // frames late, so nothing stalls. Off for clean logs; flip on when profiling where the frame time actually goes.
+    // Was ON 2026-08-03 to attribute the entity cost; that question is answered (see the entity-performance notes in
+    // CLAUDE.md), so back off for clean logs. The phases and the CPU counters below stay — flip this to re-measure.
     private static final boolean DIAG_GPU_TIME = false;
+
+    // --- CPU-side entity timing -----------------------------------------------------------------------------------
+    // GPU timer queries cannot see CPU cost, and the 2026-08-03 measurements showed the frame is often CPU-bound:
+    // GPU total ~13 ms while cpuFrame hit 28 ms. The GPU side of the camera entity pass turned out to be fragment
+    // cost (2x the entity count multiplied GPU time ~40x — superlinear, i.e. overdraw, not per-entity overhead), so
+    // whatever is left to win is on the CPU and needs its own clock. Wall-clock nanoTime, summed per frame across
+    // BOTH Forge render passes, reset in beginWorldRender.
+    private long cpuCameraEntitiesNanos;
+    private long cpuShadowEntitiesNanos;
+    private int cpuCameraEntitiesCalls;
+
+    public long entityCpuMark() {
+        return System.nanoTime();
+    }
+
+    public void addCameraEntityCpu(long startNanos) {
+        this.cpuCameraEntitiesNanos += System.nanoTime() - startNanos;
+        this.cpuCameraEntitiesCalls++;
+    }
+
+    public void addShadowEntityCpu(long startNanos) {
+        this.cpuShadowEntitiesNanos += System.nanoTime() - startNanos;
+    }
+
+    // Sub-breakdown of the shadow entity pass. It measured ~7 ms of CPU while drawing ONE entity and costing 0.00 ms
+    // of GPU, and the figure did not move with the entity count (1182 vs 2300 entities: identical), so it is a fixed
+    // per-frame cost, not a per-entity one — i.e. every shader user pays it always. These three split it into the
+    // one-off state setup, the actual caster draws, and the block-entity sweep.
+    private long shadowEntSetupNanos;
+    private long shadowEntDrawNanos;
+    private long shadowEntTesrNanos;
+
+    public void addShadowEntSetup(long t) {
+        this.shadowEntSetupNanos += System.nanoTime() - t;
+    }
+
+    public void addShadowEntDraw(long t) {
+        this.shadowEntDrawNanos += System.nanoTime() - t;
+    }
+
+    public void addShadowEntTesr(long t) {
+        this.shadowEntTesrNanos += System.nanoTime() - t;
+    }
+
+    /** Entity counts for the GPU TIME line: shadow casters actually drawn, and the leash-gate tallies. */
+    private String entityDiagSuffix() {
+        try {
+            me.jellysquid.mods.sodium.client.render.SodiumWorldRenderer r =
+                    me.jellysquid.mods.sodium.client.render.SodiumWorldRenderer.getInstanceNullable();
+            if (r == null) {
+                return "";
+            }
+            return " | shadowEntities=" + r.getShadowEntitiesDrawn() + " (culled=" + r.getShadowEntitiesCulled() + ")"
+                    + " shadowTESR=" + r.getShadowTesrDrawn()
+                    + " basicBrackets=" + this.basicBracketsRun + "/" + this.basicBracketsSkipped + " (run/skipped)"
+                    + String.format(" | CPU camEnt=%.2fms (x%d passes) shadowEnt=%.2fms"
+                                    + " [setup=%.2f draw=%.2f tesr=%.2f]",
+                            this.cpuCameraEntitiesNanos / 1.0e6, this.cpuCameraEntitiesCalls,
+                            this.cpuShadowEntitiesNanos / 1.0e6,
+                            this.shadowEntSetupNanos / 1.0e6, this.shadowEntDrawNanos / 1.0e6,
+                            this.shadowEntTesrNanos / 1.0e6);
+        } catch (Throwable t) {
+            return "";
+        }
+    }
     /** Sections the last shadow-list build selected / dropped as buried (reported next to the GPU timings). */
     private int lastShadowSections;
     private int lastShadowCulled;
@@ -5522,6 +5589,12 @@ public final class IrisPipeline {
             refreshPackShadowGeometry();
             this.basicBracketsRun = 0;      // leash-gate counters are per FRAME (F3 diagnostics)
             this.basicBracketsSkipped = 0;
+            this.cpuCameraEntitiesNanos = 0L;
+            this.cpuShadowEntitiesNanos = 0L;
+            this.cpuCameraEntitiesCalls = 0;
+            this.shadowEntSetupNanos = 0L;
+            this.shadowEntDrawNanos = 0L;
+            this.shadowEntTesrNanos = 0L;
             this.targets.resize(w, h);
 
             EntityRenderer er = mc.entityRenderer;
@@ -6247,7 +6320,10 @@ public final class IrisPipeline {
                             + " | shadowSections=" + this.lastShadowSections
                             + " (buried culled=" + this.lastShadowCulled + ")"
                             + " renderDist=" + Minecraft.getMinecraft().gameSettings.renderDistanceChunks
-                            + " shadowMap=" + this.targets.shadowSize() + "² res=" + this.targets.width() + "x" + this.targets.height());
+                            + " shadowMap=" + this.targets.shadowSize() + "² res=" + this.targets.width() + "x" + this.targets.height()
+                            // Entity counts alongside the timings, so cost-per-entity is readable straight off the
+                            // line instead of needing an F3 screenshot taken at the same moment.
+                            + entityDiagSuffix());
                 }
             }
         } catch (Throwable t) {

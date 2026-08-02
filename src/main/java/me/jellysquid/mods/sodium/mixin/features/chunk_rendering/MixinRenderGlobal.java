@@ -144,6 +144,19 @@ public abstract class MixinRenderGlobal {
         // for the pass matches vanilla, which sets up standard item lighting once before the loop; each entity's texture
         // (unit 0) and per-entity lightmap (unit 1) are picked up per-draw. try/finally so the program can't leak.
         IrisPipeline.instance().beginEntities();
+        // Own GPU phase so the CAMERA-pass entity cost is separable from the SHADOW-pass one ("shadow_entities").
+        // A switch, not a nested begin — GL_TIME_ELAPSED cannot nest (see IrisPipeline.profileSwitch).
+        IrisPipeline.instance().profileSwitch("camera_entities");
+        // CPU clock too: the GPU phase measures fragment work, which turned out to be the pack's own shading. The
+        // loop's own CPU cost (walking every loaded entity, shouldRender's per-entity AABB allocation, the id
+        // resolve) is invisible to a GL timer and is what the frame is actually waiting on.
+        final long yumelium$cpuStart = IrisPipeline.instance().entityCpuMark();
+        // Loop-invariant work hoisted out of a body that runs once per LOADED entity per render pass (2300 entities
+        // x 2 passes on the benchmark). Vanilla recomputes both inside the loop; neither depends on `entity`.
+        final SodiumWorldRenderer yumelium$renderer = SodiumWorldRenderer.getInstance();
+        final boolean yumelium$isSleeping = renderViewEntity instanceof EntityLivingBase
+                && ((EntityLivingBase) renderViewEntity).isPlayerSleeping();
+        final boolean yumelium$thirdPerson = this.mc.gameSettings.thirdPersonView != 0;
         try {
         for (Entity entity : loadedEntityList) {
             // Skip entities that shouldn't render in this pass
@@ -157,13 +170,11 @@ public abstract class MixinRenderGlobal {
             }
 
             // Check if any corners of the bounding box are in a visible subchunk
-            if (!SodiumWorldRenderer.getInstance().isEntityVisible(entity)) {
+            if (!yumelium$renderer.isEntityVisible(entity)) {
                 continue;
             }
 
-            boolean isSleeping = renderViewEntity instanceof EntityLivingBase && ((EntityLivingBase) renderViewEntity).isPlayerSleeping();
-
-            if ((entity != renderViewEntity || this.mc.gameSettings.thirdPersonView != 0 || isSleeping)
+            if ((entity != renderViewEntity || yumelium$thirdPerson || yumelium$isSleeping)
                     && (entity.posY < 0.0D || entity.posY >= 256.0D || this.world.isBlockLoaded(entityBlockPos.setPos(entity)))) {
                 ++this.countEntitiesRendered;
                 this.renderManager.renderEntityStatic(entity, partialTicks, false);
@@ -178,6 +189,8 @@ public abstract class MixinRenderGlobal {
             }
         }
         } finally {
+            IrisPipeline.instance().addCameraEntityCpu(yumelium$cpuStart);
+            IrisPipeline.instance().profileSwitch("gb_other"); // back to the enclosing gbuffers phase
             IrisPipeline.instance().endEntities();
         }
     }
