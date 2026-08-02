@@ -32,12 +32,26 @@ public class MixinEntityRendererYumeliumPlus {
         }
     }
 
-    // Turn GL fog back off right after vanilla configures it, so nothing renders fog this frame — EXCEPT fluid fog.
-    // Like OptiFine's "Fog: OFF", the toggle kills only ATMOSPHERIC distance fog: the dense EXP fog vanilla sets when
-    // the CAMERA is inside water/lava IS the underwater/in-lava look (with shaders off there is nothing else — the
-    // first-person water overlay masked its absence, but in third person the world read as clear air, 2026-07-31).
-    // Same decision source as setupFog itself (getBlockStateAtEntityViewpoint = camera block incl. third-person
-    // offset), so first/third-person semantics match vanilla exactly.
+    // Turn GL fog back off right after vanilla configures it, so nothing renders fog this frame — EXCEPT fog that is
+    // not "atmosphere". Like OptiFine's "Fog: OFF", the toggle kills only ATMOSPHERIC distance fog. Two exemptions:
+    //
+    // 1. FLUID. The dense EXP fog vanilla sets when the CAMERA is inside water/lava IS the underwater/in-lava look
+    //    (with shaders off there is nothing else — the first-person water overlay masked its absence, but in third
+    //    person the world read as clear air, 2026-07-31). Same decision source as setupFog itself
+    //    (getBlockStateAtEntityViewpoint = camera block incl. third-person offset), so first/third-person semantics
+    //    match vanilla exactly.
+    //
+    // 2. BLINDNESS. Vanilla renders the potion effect ITSELF as fog: setupFog's blindness branch (verified in the
+    //    Forge-patched bytecode at bci 70-87) switches to LINEAR with a far plane that collapses to ~5 blocks
+    //    (ramping in over the last 20 ticks). Disabling it would not remove an atmospheric preference, it would
+    //    remove the effect — a gameplay change, and one that also silently defeats every mod that applies blindness.
+    //
+    // Forge's ForgeHooksClient.getFogDensity hook (bci 42-67) runs FIRST and skips the rest of setupFog when a mod
+    // returns a density >= 0; that path is how content mods supply their own atmospheric fog, and it is exactly what
+    // the toggle exists to turn off — so it gets no exemption of its own. Note the two exemptions above are tested
+    // against the WORLD, not against which branch of setupFog ran, so a blind player (or one submerged) keeps
+    // whatever fog is configured even when a mod supplied it. That is the intended precedence: while blindness is
+    // active, removing fog would hand the player vision the effect is supposed to deny, whichever code set it.
     @Inject(method = "setupFog", at = @At("RETURN"))
     private void yumelium$toggleFog(int startCoords, float partialTicks, CallbackInfo ci) {
         if (SodiumClientMod.options().yumeliumPlus.renderFog) {
@@ -45,6 +59,11 @@ public class MixinEntityRendererYumeliumPlus {
         }
         net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getMinecraft();
         net.minecraft.entity.Entity view = mc.getRenderViewEntity();
+        if (view instanceof net.minecraft.entity.EntityLivingBase
+                && ((net.minecraft.entity.EntityLivingBase) view)
+                        .isPotionActive(net.minecraft.init.MobEffects.BLINDNESS)) {
+            return;
+        }
         if (view != null && mc.world != null) {
             net.minecraft.block.material.Material m = net.minecraft.client.renderer.ActiveRenderInfo
                     .getBlockStateAtEntityViewpoint(mc.world, view, partialTicks).getMaterial();

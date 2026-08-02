@@ -866,6 +866,18 @@ public class RenderSectionManager {
             return renderDistance;
         }
 
+        // The cull must key on the SAME state the fog rendering keys on. FogHelper.getFogCutoff() reads only
+        // fogState.mode/end/density; it never looks at fogState.fog.currentState, so GL fog that has been switched
+        // OFF still yields its last cutoff distance. The Yumelium Plus "Fog" toggle disables fog exactly that way
+        // (GlStateManager.disableFog() clears the enable bit and leaves mode/end alone), so with the toggle off the
+        // terrain shader compiled ChunkFogMode.NONE — no fog drawn — while sections past the stale fog end were
+        // still never visited: a hard terrain edge against the fog-coloured clear, with nothing to hide it. Worst in
+        // the Nether and the Betweenlands, whose FogHandler writes a short fog end from inside setupFog.
+        // getFogMode() is the oracle ChunkShaderOptions itself uses, so this can never cull tighter than what draws.
+        if (FogHelper.getFogMode() == me.jellysquid.mods.sodium.client.render.chunk.shader.ChunkFogMode.NONE) {
+            return renderDistance;
+        }
+
         var color = FogHelper.getFogColor();
         var distance = FogHelper.getFogCutoff();
 
