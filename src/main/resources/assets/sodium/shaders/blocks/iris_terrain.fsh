@@ -32,7 +32,16 @@ uniform float u_FogDensity; // The density of the shader fog
 out vec4 fragColor; // The output fragment for the color framebuffer
 
 void main() {
+    // Keep this sampling in step with block_layer_opaque.fsh: the alpha-tested pass samples the BASE level explicitly.
+    // A mip BIAS is only ADDED to the derivative-computed LOD, so it cannot pin the level — distant foliage otherwise
+    // resolves several mips down, where MC's atlas blends a sprite with the transparent BLACK around it and the leaf
+    // goes black. This file is the fallback the pipeline falls back to when the pack's gbuffers_terrain transform
+    // throws, so it must not reintroduce a bug that is fixed in the primary path.
+#ifdef USE_FRAGMENT_DISCARD
+    vec4 diffuseColor = textureLod(u_BlockTex, v_TexCoord, 0.0);
+#else
     vec4 diffuseColor = texture(u_BlockTex, v_TexCoord, v_MaterialMipBias);
+#endif
 
 #ifdef USE_FRAGMENT_DISCARD
     if (diffuseColor.a < v_MaterialAlphaCutoff) {
