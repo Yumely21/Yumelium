@@ -106,7 +106,7 @@ public class RenderSectionManager {
     // The 67k-section walk in updateShadowRenderList cost 2-3 ms CPU EVERY frame at rd32. The cached list is only a
     // candidate SET — draw positions and the encode-time cull always use the CURRENT camera and matrices
     // (DefaultChunkRenderer), so over-inclusion is harmless and only OMISSION matters. The build therefore culls
-    // with SHADOW_LIST_MARGIN of extra slack, and the list is rebuilt before the allowed drift can consume it.
+    // with shadowListMargin() of extra slack, and the list is rebuilt before the allowed drift can consume it.
     /** Topology/geometry changed since the last build (set by {@link #updateSectionInfo}). */
     private boolean shadowListDirty = true;
     private double shadowListCameraX, shadowListCameraY, shadowListCameraZ;
@@ -117,14 +117,73 @@ public class RenderSectionManager {
      * direction (only reachable with user SUN_ANGLE settings that take the sun near vertical). */
     private boolean shadowListUpFlipped;
     private int[] shadowListVoxHalf;
+    /** The pack shadow distance the cached list was culled against; NaN forces the first build. */
+    private float shadowListShadowDistance = Float.NaN;
+    /** Rotation part of the shadow view matrix at build time, row-major (m00,m10,m20, m01,m11,m21, m02,m12,m22).
+     * Paired with {@link #SHADOW_LIST_BASIS_EPS}. */
+    private final float[] shadowListBasis = new float[9];
     private int shadowListAge;
 
-    /** Max per-axis camera drift (blocks) tolerated before rebuild. Paired invariant with SHADOW_LIST_MARGIN:
-     * √3·THIS + 0.00873·673 (0.5° light rotation at the box's max radius) ≈ 19.7 ≤ MARGIN + ~10 (shadow box slack),
-     * and THIS ≤ MARGIN − 8 (voxel box, per-axis). Change one ⇒ re-derive the other. */
+    /** Max per-axis camera drift (blocks) tolerated before rebuild. Paired with the build margin — see
+     * {@link #shadowListMargin()}, which DERIVES the margin from this and from the pack's live shadow distance so the
+     * pair can no longer drift apart by hand. */
     private static final double SHADOW_LIST_REBUILD_DISTANCE = 8.0;
-    /** Extra cull slack (blocks) applied ONLY at list build, so the cached list provably covers the drift above. */
-    private static final float SHADOW_LIST_MARGIN = 16.0F;
+    /**
+     * Rebuild threshold for the shadow-map BASIS, as the Frobenius norm of the change in its rotation part.
+     *
+     * <p>This deliberately does not measure an angle. What displaces a section in light space is
+     * {@code l = M·p}, so the drift to bound is {@code |(M_now − M_build)·p| ≤ ‖ΔM‖_F · |p|} — a matrix-norm
+     * statement that is true for ANY basis change, with no trigonometry and therefore no geometry left to model
+     * wrongly. The same constant then appears in {@link #shadowListMargin()} multiplied by the box radius, so the
+     * cache key and the margin are two halves of one inequality by construction.</p>
+     *
+     * <p>Why not the light DIRECTION (which SHADOW_LIST_LIGHT_DOT_MIN keys on, and which is kept as a cheap
+     * additional trigger): the basis comes from {@code lookAt(light, origin, up)}, and the cross product with a
+     * fixed up-vector AMPLIFIES azimuthal light motion as the sun approaches vertical. A half-degree of light
+     * movement can roll the basis by several degrees, which a direction-only key cannot see. That was harmless
+     * while the ortho was pinned at ±192; once the box follows the pack's shadowDistance the box radius — and with
+     * it the displacement per degree — grows, so the gap became reachable at large shadow distances with a
+     * non-default SUN_ANGLE.</p>
+     *
+     * <p>Value: the Frobenius norm of a rotation by α is {@code 2√2·sin(α/2)}, so 0.5° ⇒ 0.012340. Chosen to keep
+     * the rebuild cadence the previous 0.5° direction threshold produced.</p>
+     */
+    private static final float SHADOW_LIST_BASIS_EPS = 0.01234F;
+
+    /**
+     * Extra cull slack (blocks) applied ONLY at list build, so the cached list provably stays a superset of what the
+     * exact per-frame encode cull will accept for any drift below the rebuild thresholds.
+     *
+     * <p>Two constraints, both of which must hold; the margin is their max:</p>
+     * <ul>
+     *   <li><b>A (shadow box):</b> {@code √3·drift + rot·R ≤ MARGIN + boxSlack}, where {@code R} is the shadow box's
+     *       max radius in light space and {@code boxSlack} is the part of the pipeline's per-axis section slack not
+     *       already consumed by a section's own half-diagonal (8√3). {@code R} grows with the shadow distance, which
+     *       is why this must be computed and not written down: the old constant was derived at shadowDistance=192.</li>
+     *   <li><b>B (voxel box):</b> {@code drift ≤ MARGIN − 8}, per axis.</li>
+     * </ul>
+     *
+     * <p>Sanity check against the value this replaces: at shadowDistance 192, R = √(2·216² + 600²) ≈ 673, so
+     * A needs √3·8 + 0.00873·673 − 10.14 ≈ 9.6 and B needs 8 + 8 = 16 → 16.0, exactly the constant that was verified
+     * in-game. B dominates for every realistic shadow distance; A only overtakes it past ~500 blocks.</p>
+     */
+    private static float shadowListMargin() {
+        float shadowDistance = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.shadowDistanceBlocks();
+        float sectionSlack = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.SHADOW_BOX_SECTION_SLACK;
+        float eyePullback = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.SHADOW_EYE_PULLBACK;
+
+        // Light-space half-extents of the box isSectionOutsideShadow tests against.
+        float cull = shadowDistance + sectionSlack;                                  // |lx|, |ly|
+        float depth = 2.0F * (shadowDistance + eyePullback) + sectionSlack;          // lz span
+        float maxRadius = (float) Math.sqrt(2.0 * cull * cull + (double) depth * depth);
+
+        // The section half-diagonal already eats part of the pipeline's per-axis slack; only the rest is headroom.
+        float boxSlack = sectionSlack - 8.0F * (float) Math.sqrt(3.0);
+        float a = (float) (Math.sqrt(3.0) * SHADOW_LIST_REBUILD_DISTANCE)
+                + SHADOW_LIST_BASIS_EPS * maxRadius - boxSlack;
+        float b = (float) SHADOW_LIST_REBUILD_DISTANCE + 8.0F;
+        return Math.max(a, b);
+    }
     /** cos(0.5°): rebuild when the shadow light has rotated more than half a degree since the build. Do not tighten
      * below ~cos(0.05°) — it would drown in normalize() float noise and rebuild every frame. */
     private static final float SHADOW_LIST_LIGHT_DOT_MIN = 0.99996192F;
@@ -432,13 +491,25 @@ public class RenderSectionManager {
                 || Math.abs(camera.y - this.shadowListCameraY) > SHADOW_LIST_REBUILD_DISTANCE
                 || Math.abs(camera.z - this.shadowListCameraZ) > SHADOW_LIST_REBUILD_DISTANCE;
         boolean lightMoved = this.shadowListLightDir.dot(light.x(), light.y(), light.z()) < SHADOW_LIST_LIGHT_DOT_MIN;
+        // The basis is what actually moves a section in light space, and it can rotate faster than the light
+        // direction does — see SHADOW_LIST_BASIS_EPS. This is the trigger the margin's rotation term is paired with;
+        // lightMoved above is kept as a cheaper early trigger, and upFlipped as belt-and-braces for the discontinuous
+        // up-vector switch (which this norm would also catch, since the basis rolls).
+        boolean basisMoved = shadowBasisDrift(pipeline.shadowViewMatrix()) > SHADOW_LIST_BASIS_EPS;
         boolean upFlipped = Math.abs(light.y()) > 0.99F;
         boolean voxChanged = !java.util.Arrays.equals(cacheVoxHalf, this.shadowListVoxHalf);
-        if (!this.shadowListDirty && !cameraMoved && !lightMoved && upFlipped == this.shadowListUpFlipped && !voxChanged
-                && this.shadowListAge < SHADOW_LIST_MAX_AGE) {
+        // The shadow distance is a live shader-option slider: moving it resizes the very box this list was culled
+        // against, so a cached list built for the old box may be missing sections the new one needs. Exact compare —
+        // the option only changes when the user changes it.
+        float shadowDistance = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.shadowDistanceBlocks();
+        boolean shadowBoxChanged = shadowDistance != this.shadowListShadowDistance;
+        if (!this.shadowListDirty && !cameraMoved && !lightMoved && !basisMoved
+                && upFlipped == this.shadowListUpFlipped && !voxChanged
+                && !shadowBoxChanged && this.shadowListAge < SHADOW_LIST_MAX_AGE) {
             this.shadowListAge++;
             return; // reuse this.shadowRenderLists; shadowFrame deliberately NOT incremented (no reset needed)
         }
+        final float margin = shadowListMargin();
 
         // Its OWN counter — see the shadowFrame field. Using the camera's lastUpdatedFrame overflowed the lists.
         var collector = new VisibleChunkCollector(++this.shadowFrame, true);
@@ -463,14 +534,14 @@ public class RenderSectionManager {
             float rz = (float) ((section.getOriginZ() + 8) - camera.z);
 
             // +16: the section's own extent (±8 around its centre) plus the voxelizer's sub-block offsets.
-            // +SHADOW_LIST_MARGIN: build-only slack so the CACHED list stays a superset of the encode-time
+            // +margin (shadowListMargin()): build-only slack so the CACHED list stays a superset of the encode-time
             // exemption for any camera drift below the rebuild threshold (colored light must never pop).
             boolean inVoxelVolume = voxHalf != null
-                    && Math.abs(rx) <= voxHalf[0] + 16.0F + SHADOW_LIST_MARGIN
-                    && Math.abs(ry) <= voxHalf[1] + 16.0F + SHADOW_LIST_MARGIN
-                    && Math.abs(rz) <= voxHalf[2] + 16.0F + SHADOW_LIST_MARGIN;
+                    && Math.abs(rx) <= voxHalf[0] + 16.0F + margin
+                    && Math.abs(ry) <= voxHalf[1] + 16.0F + margin
+                    && Math.abs(rz) <= voxHalf[2] + 16.0F + margin;
             if (!inVoxelVolume) {
-                if (pipeline.isSectionOutsideShadow(rx, ry, rz, SHADOW_LIST_MARGIN)) {
+                if (pipeline.isSectionOutsideShadow(rx, ry, rz, margin)) {
                     continue;
                 }
                 if (SHADOW_CULL_UNDERGROUND && isFullyUnderground(section)) {
@@ -496,6 +567,29 @@ public class RenderSectionManager {
         this.shadowListLightDir.set(light.x(), light.y(), light.z());
         this.shadowListUpFlipped = Math.abs(light.y()) > 0.99F;
         this.shadowListVoxHalf = cacheVoxHalf == null ? null : cacheVoxHalf.clone();
+        this.shadowListShadowDistance = shadowDistance;
+        storeShadowBasis(pipeline.shadowViewMatrix());
+    }
+
+    /**
+     * @return {@code ‖M_now − M_build‖_F} over the rotation part of the shadow view matrix. Bounds the light-space
+     * displacement of any section since the build by {@code (this) × |p|}, which is exactly the quantity
+     * {@link #shadowListMargin()}'s rotation term budgets for.
+     */
+    private float shadowBasisDrift(org.joml.Matrix4fc m) {
+        float[] b = this.shadowListBasis;
+        float d0 = m.m00() - b[0], d1 = m.m10() - b[1], d2 = m.m20() - b[2];
+        float d3 = m.m01() - b[3], d4 = m.m11() - b[4], d5 = m.m21() - b[5];
+        float d6 = m.m02() - b[6], d7 = m.m12() - b[7], d8 = m.m22() - b[8];
+        return (float) Math.sqrt(d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3 + d4 * d4
+                + d5 * d5 + d6 * d6 + d7 * d7 + d8 * d8);
+    }
+
+    private void storeShadowBasis(org.joml.Matrix4fc m) {
+        float[] b = this.shadowListBasis;
+        b[0] = m.m00(); b[1] = m.m10(); b[2] = m.m20();
+        b[3] = m.m01(); b[4] = m.m11(); b[5] = m.m21();
+        b[6] = m.m02(); b[7] = m.m12(); b[8] = m.m22();
     }
 
     /**

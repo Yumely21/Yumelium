@@ -902,12 +902,14 @@ public final class IrisPipeline {
     // composite to darken shadowed ground. v1 reuses Sodium's camera-visible section set (so it shadows visible terrain —
     // e.g. a hill onto the valley in front of you; geometry just out of view doesn't cast). Only active in shader mode.
     private static final boolean SHADOWS_ENABLED = true;
-    // Must match Complementary's `const float shadowDistance` (192 for the user's profile) so our shadow ortho covers the
-    // same world area the pack's shadow lookup (via our shadowProjection uniform) expects.
-    private static final float SHADOW_DISTANCE = 192.0F; // orthographic half-extent (blocks) around the camera
+    // FALLBACK only. The live values come from the pack's `shadowDistance` option via refreshPackShadowGeometry();
+    // these are what we use when the pack declares no such option or declares a degenerate one. 192 was the profile
+    // the pipeline was originally developed against, and hardcoding it is what put every shadow in the wrong place
+    // once the slider moved (fixed 2026-08-02).
+    private static final float SHADOW_DISTANCE_FALLBACK = 192.0F; // orthographic half-extent (blocks) around the camera
     // Complementary's shadow distortion bias: const float shadowMapBias = 1.0 - 25.6 / shadowDistance. The shadow-pass
     // vertex warp (TerrainShaderTransformer) must use the SAME value as the terrain lookup's GetShadowPos.
-    private static final float SHADOW_MAP_BIAS = 1.0F - 25.6F / SHADOW_DISTANCE;
+    private static final float SHADOW_MAP_BIAS_FALLBACK = 1.0F - 25.6F / SHADOW_DISTANCE_FALLBACK;
 
     // shadowPlayer = true: the player (+ vehicle) rendered into the shadow map through MC's fixed-function entity
     // renderer with THIS program bound. It applies the pack's radial distortion + z-squash AFTER the ortho matrices —
@@ -987,9 +989,10 @@ public final class IrisPipeline {
         return !DIAG_SHADOW_PLAYER_OFF && this.enabled && this.playerShadowProgram != null;
     }
 
-    /** The shadow ortho half-extent in blocks — the entity shadow caster cull radius must match the box. */
+    /** The shadow ortho half-extent in blocks — the entity shadow caster cull radius must match the box. LIVE value
+     * from the pack's shadowDistance slider (see {@link #refreshPackShadowGeometry()}), not a constant. */
     public static float shadowDistanceBlocks() {
-        return SHADOW_DISTANCE;
+        return instance().shadowDistanceThisFrame;
     }
 
     /** @return the shadow map edge length in texels (F3 debug), or 0 while the pipeline has no targets. */
@@ -1014,18 +1017,19 @@ public final class IrisPipeline {
 
     /** Binds the distortion-matching player-shadow program (diffuse on unit 0) for the fixed-function entity render.
      * The bias MUST come from the pack's live shadowDistance, not the built-in profile constant — see
-     * {@link #packShadowMapBias()}; a mismatch here is what puts entity shadows in the wrong place at the wrong size
-     * while terrain shadows stay correct. Cached per shadow pass by {@link #renderShadowPass}. */
+     * {@link #refreshPackShadowGeometry()}; a mismatch here is what puts entity shadows in the wrong place at the
+     * wrong size while terrain shadows stay correct. Sampled once per frame in beginWorldRender. */
     public void usePlayerShadowProgram() {
         this.playerShadowProgram.use();
         this.playerShadowProgram.setInt("tex", 0);
         this.playerShadowProgram.setFloat("shadowMapBias", this.shadowMapBiasThisFrame);
     }
 
-    /** {@link #packShadowMapBias()} sampled once per shadow pass — usePlayerShadowProgram runs per caster, and the
-     * option lookup is a map get + parse. Initialised to the built-in profile so a draw before the first shadow pass
-     * (or with no pack options loaded) behaves exactly as before. */
-    private float shadowMapBiasThisFrame = SHADOW_MAP_BIAS;
+    /** The pack's shadow geometry, sampled once per frame by {@link #refreshPackShadowGeometry()} — the consumers run
+     * per draw, per caster and per section. Initialised to the built-in profile so anything that runs before the
+     * first refresh (or with no pack options loaded) behaves exactly as the old hardcoded constants did. */
+    private float shadowMapBiasThisFrame = SHADOW_MAP_BIAS_FALLBACK;
+    private float shadowDistanceThisFrame = SHADOW_DISTANCE_FALLBACK;
 
     private final Matrix4f shadowProjection = new Matrix4f();
     private final Matrix4f shadowModelView = new Matrix4f();
@@ -3223,32 +3227,26 @@ public final class IrisPipeline {
     }
 
     /**
-     * The pack's live {@code shadowDistance} option, which drives its {@code const float shadowMapBias = 1.0 - 25.6 /
-     * shadowDistance}. Read per frame rather than baked in: it is a user-facing slider in the shader options screen,
-     * and {@link #SHADOW_DISTANCE} was hardcoded to one profile's value (192) — with the slider at anything else, the
-     * entity shadow program distorted with a bias the pack's own lookup did not agree with. See
-     * {@link #packShadowMapBias()}.
-     */
-    private float packShadowDistance() {
-        return floatOption(shaderOptions(), "shadowDistance", SHADOW_DISTANCE);
-    }
-
-    /**
-     * The pack's radial shadow distortion bias, derived from ITS shadowDistance.
+     * Re-reads the pack's {@code shadowDistance} option and derives everything the shadow box needs from it:
+     * the ortho half-extent ({@link #shadowDistanceThisFrame}) and the radial distortion bias
+     * ({@link #shadowMapBiasThisFrame}, the pack's {@code const float shadowMapBias = 1.0 - 25.6 / shadowDistance}).
      *
-     * <p>Everything on the terrain path — the write (the pack's own shadow vertex, via TerrainShaderTransformer) and
-     * the read (the pack's GetShadowPos in deferred/composite) — uses the pack's own const, so terrain shadows are
-     * self-consistent whatever the slider says. The ONE place that has to reproduce it host-side is the hand-written
-     * entity/player shadow program, which re-applies the distortion manually. Feeding it the 192-profile constant
-     * while the pack computed 128 made entity shadows land offset and at the wrong scale against correct terrain
-     * shadows (reported 2026-08-02; the option file had been changed to shadowDistance=128 the previous evening).
+     * <p>Read per frame rather than baked in: it is a user-facing slider in the shader options screen. Hardcoding it
+     * to one profile's 192 is what put every shadow in the wrong place once the slider moved to 128 — the write
+     * (our two bias uniforms) disagreed with the pack's own lookup, radially about the camera.</p>
+     *
+     * <p>Both derived values are sampled ONCE per frame here because their consumers run per draw, per caster and
+     * per section. Sanity guard: {@code d} must exceed 25.6 (below that the bias is ≤ 0, i.e. no distortion or an
+     * inverted one) and stay finite; anything else falls back to the built-in profile rather than producing a
+     * degenerate shadow box.</p>
      */
-    private float packShadowMapBias() {
-        float d = packShadowDistance();
-        if (!(d > 25.6F)) {
-            return SHADOW_MAP_BIAS; // nonsensical/degenerate slider value — keep the built-in profile
+    private void refreshPackShadowGeometry() {
+        float d = floatOption(shaderOptions(), "shadowDistance", SHADOW_DISTANCE_FALLBACK);
+        if (Float.isNaN(d) || !(d > 25.6F) || !(d <= 4096.0F)) {
+            d = SHADOW_DISTANCE_FALLBACK;
         }
-        return 1.0F - 25.6F / d;
+        this.shadowDistanceThisFrame = d;
+        this.shadowMapBiasThisFrame = 1.0F - 25.6F / d;
     }
 
     /**
@@ -4425,23 +4423,35 @@ public final class IrisPipeline {
         return new org.joml.Vector3d(this.cameraX, this.cameraY, this.cameraZ);
     }
 
-    // Shadow-pass geometry cull margin: the shadow ortho covers exactly ±SHADOW_DISTANCE in the two light-view axes
+    // Shadow-pass geometry cull margin: the shadow ortho covers exactly ±shadowDistanceThisFrame in the two light-view axes
     // perpendicular to the sun, so a section whose centre projects beyond that (plus a section-radius margin) can't cast
     // into the shadow map. Culling those stops the shadow pass from re-drawing the ENTIRE camera-visible terrain (out to
     // the render distance) when the map only needs ~192 blocks around the camera — the dominant cost at high render
     // distance (the shadow pass reuses the camera-visible section set, so without this it draws render-distance² geometry).
-    private static final float SHADOW_CULL_EXTENT = SHADOW_DISTANCE + 24.0F;
+    /** Section-radius slack added to the box on every axis. A 16³ section's half-diagonal is 8√3 ≈ 13.86, so this
+     * leaves ≈10.14 blocks of genuine headroom — the "~10 shadow box slack" term the shadow-list margin derivation in
+     * RenderSectionManager relies on. Changing it changes that derivation. */
+    public static final float SHADOW_BOX_SECTION_SLACK = 24.0F;
+
+    private float shadowCullExtent() {
+        return this.shadowDistanceThisFrame + SHADOW_BOX_SECTION_SLACK;
+    }
 
     // Depth (along-sun) bounds of the shadow ortho in light-view space. computeShadowMatrices puts the light eye at
-    // distance d = SHADOW_DISTANCE + 96 and uses ortho far = 2·d, so a point's view-space Z (negative in front of the eye)
+    // distance d = shadowDistanceThisFrame + 96 and uses ortho far = 2·d, so a point's view-space Z (negative in front of the eye)
     // is inside the box when −Z ∈ [~0, 2·d]; i.e. lz ∈ [−(2·d), 0]. The camera itself sits at lz = −d (box centre).
-    private static final float SHADOW_EYE_DISTANCE = SHADOW_DISTANCE + 96.0F;
+    /** Light-eye pull-back beyond the box half-extent, so the near plane clears it. */
+    public static final float SHADOW_EYE_PULLBACK = 96.0F;
+
+    private float shadowEyeDistance() {
+        return this.shadowDistanceThisFrame + SHADOW_EYE_PULLBACK;
+    }
 
     /**
      * @return true if a 16³ section centred at {@code (rx,ry,rz)} RELATIVE TO THE CAMERA falls outside the shadow ortho
      * box, so it need not be drawn in the shadow pass. Only meaningful while {@link #isShadowPass()} (the shadow matrices
      * are built camera-relative, camera at the origin). Full frustum test: the two axes perpendicular to the sun (±
-     * SHADOW_DISTANCE) plus the along-sun depth range — so it never drops a caster the shadow map would actually sample.
+     * shadowDistanceThisFrame) plus the along-sun depth range — so it never drops a caster the shadow map would actually sample.
      */
     public boolean isSectionOutsideShadow(float rx, float ry, float rz) {
         return isSectionOutsideShadow(rx, ry, rz, 0.0F);
@@ -4449,16 +4459,18 @@ public final class IrisPipeline {
 
     /** {@code margin}: extra blocks of slack on every bound — used by the shadow-list CACHE build so the cached
      * list provably covers the camera/sun drift allowed below the rebuild thresholds (see
-     * RenderSectionManager.SHADOW_LIST_MARGIN). Encode-time culling passes 0. */
+     * RenderSectionManager.shadowListMargin(), which derives it from this box's size). Encode-time culling passes 0. */
     public boolean isSectionOutsideShadow(float rx, float ry, float rz, float margin) {
         Matrix4f m = this.shadowModelView;
         float lx = m.m00() * rx + m.m10() * ry + m.m20() * rz + m.m30();
         float ly = m.m01() * rx + m.m11() * ry + m.m21() * rz + m.m31();
-        if (Math.abs(lx) > SHADOW_CULL_EXTENT + margin || Math.abs(ly) > SHADOW_CULL_EXTENT + margin) {
+        float cullExtent = shadowCullExtent();
+        if (Math.abs(lx) > cullExtent + margin || Math.abs(ly) > cullExtent + margin) {
             return true;
         }
         float lz = m.m02() * rx + m.m12() * ry + m.m22() * rz + m.m32();
-        return lz > 24.0F + margin || lz < -(2.0F * SHADOW_EYE_DISTANCE) - 24.0F - margin;
+        return lz > SHADOW_BOX_SECTION_SLACK + margin
+                || lz < -(2.0F * shadowEyeDistance()) - SHADOW_BOX_SECTION_SLACK - margin;
     }
 
     /** Half-extents of the pack's camera-anchored colored-lighting voxel volume, or {@code null} when colored lighting
@@ -4488,7 +4500,7 @@ public final class IrisPipeline {
      * water depth reaching shadowtex0, the opaque copy differing, the tint being written, and the resulting density.
      */
     private void diagUnderwaterShadow() {
-        final float bias = 1.0F - 25.6F / SHADOW_DISTANCE;
+        final float bias = this.shadowMapBiasThisFrame;
         int res = this.targets.shadowSize();
         // Locate the REAL seabed under the camera so each probe can be compared against it: the horizontal shaft cutoff
         // means the "opaque surface" the VL sees (z crossing tex1) sits somewhere — this tells us whether that height
@@ -4560,7 +4572,7 @@ public final class IrisPipeline {
     }
 
     private void diagShadowPos() {
-        final float bias = 1.0F - 25.6F / SHADOW_DISTANCE; // pack: shadowMapBias = 1.0 - 25.6 / shadowDistance
+        final float bias = this.shadowMapBiasThisFrame; // pack: shadowMapBias = 1.0 - 25.6 / shadowDistance
         StringBuilder sb = new StringBuilder("[SHADOWPOS] bias=" + String.format("%.4f", bias)
                 + " smvTranslation=(" + String.format("%.2f,%.2f,%.2f",
                 this.shadowModelView.m30(), this.shadowModelView.m31(), this.shadowModelView.m32())
@@ -4652,7 +4664,7 @@ public final class IrisPipeline {
     }
 
     /**
-     * Builds the shadow-map matrices for this frame: an orthographic box of half-extent {@link #SHADOW_DISTANCE} centred
+     * Builds the shadow-map matrices for this frame: an orthographic box of half-extent {@code shadowDistanceThisFrame} centred
      * on the camera, viewed from the sun's world direction. Geometry is fed to the chunk shader in <b>camera-relative</b>
      * world space (the region offsets are camera-relative), so the shadow view/projection are built in that same space —
      * the camera sits at the origin.
@@ -4693,13 +4705,13 @@ public final class IrisPipeline {
         light.normalize();
         this.diagShadowLight.set(light);
 
-        float d = SHADOW_DISTANCE + 96.0F;                 // eye distance so the near plane clears the box
+        float d = shadowEyeDistance();                     // eye distance so the near plane clears the box
         Vector3f up = Math.abs(light.y) > 0.99F ? new Vector3f(0.0F, 0.0F, 1.0F) : new Vector3f(0.0F, 1.0F, 0.0F);
         this.shadowModelView.identity().lookAt(
                 light.x * d, light.y * d, light.z * d,
                 0.0F, 0.0F, 0.0F,
                 up.x, up.y, up.z);
-        float s = SHADOW_DISTANCE;
+        float s = this.shadowDistanceThisFrame;
         this.shadowProjection.identity().ortho(-s, s, -s, s, 0.05F, 2.0F * d, false);
         this.shadowProjection.mul(this.shadowModelView, this.shadowModelViewProjection);
         // Inverses for the pack's shadow.vsh position round-trip (shadowModelViewInverse·shadowProjectionInverse·ftransform).
@@ -4928,6 +4940,15 @@ public final class IrisPipeline {
         return this.diagShadowLight;
     }
 
+    /** Read-only view of this frame's shadow view matrix, built by computeShadowMatrices at the top of the shadow
+     * pass. The shadow-list cache keys on its ROTATION part: light-space section coordinates are this matrix applied
+     * to the camera-relative position, so the basis is what actually moves them — and the basis can rotate faster
+     * than the light DIRECTION does (the up-vector cross product amplifies azimuthal motion near a vertical sun).
+     * Do not mutate. */
+    public org.joml.Matrix4fc shadowViewMatrix() {
+        return this.shadowModelView;
+    }
+
     /**
      * DIAGNOSTIC (mob shadows, "only the loop's first entity lands"): snapshot of every pipeline state a
      * fixed-function entity renderer could leak that the shadow caster draw depends on. STATE queries are the
@@ -5074,7 +5095,7 @@ public final class IrisPipeline {
         float w = clip.w == 0 ? 1e-6F : clip.w;
         float ndcX = clip.x / w, ndcY = clip.y / w, ndcZ = clip.z / w;
         float distb = (float) Math.sqrt(ndcX * ndcX + ndcY * ndcY);
-        float factor = distb * SHADOW_MAP_BIAS + (1.0F - SHADOW_MAP_BIAS);
+        float factor = distb * this.shadowMapBiasThisFrame + (1.0F - this.shadowMapBiasThisFrame);
         float u = (ndcX / factor) * 0.5F + 0.5F;
         float v = (ndcY / factor) * 0.5F + 0.5F;
         float depth = (ndcZ * 0.2F) * 0.5F + 0.5F;
@@ -5190,7 +5211,7 @@ public final class IrisPipeline {
         float w = clip.w == 0 ? 1e-6F : clip.w;
         float ndcX = clip.x / w, ndcY = clip.y / w, ndcZ = clip.z / w;
         float distb = (float) Math.sqrt(ndcX * ndcX + ndcY * ndcY);
-        float factor = distb * SHADOW_MAP_BIAS + (1.0F - SHADOW_MAP_BIAS);
+        float factor = distb * this.shadowMapBiasThisFrame + (1.0F - this.shadowMapBiasThisFrame);
         float u = (ndcX / factor) * 0.5F + 0.5F;
         float v = (ndcY / factor) * 0.5F + 0.5F;
         float groundDepth = (ndcZ * 0.2F) * 0.5F + 0.5F;
@@ -5200,7 +5221,7 @@ public final class IrisPipeline {
         java.nio.FloatBuffer block = org.lwjgl.BufferUtils.createFloatBuffer(64 * 64);
         org.lwjgl.opengl.GL45C.glGetTextureSubImage(this.targets.shadowDepthTexId(), 0,
                 cxT - 32, cyT - 32, 0, 64, 64, 1, GL11.GL_DEPTH_COMPONENT, GL11.GL_FLOAT, block);
-        float halfBlock = 0.5F * 0.2F / (2.0F * (SHADOW_DISTANCE + 96.0F)); // 0.5 blocks along the light in window depth
+        float halfBlock = 0.5F * 0.2F / (2.0F * shadowEyeDistance()); // 0.5 blocks along the light in window depth
         int above = 0;
         float mn = 1.0F;
         for (int i = 0; i < 64 * 64; i++) {
@@ -5447,10 +5468,10 @@ public final class IrisPipeline {
             // Match the shadow map size to the pack's shadowMapResolution const (god rays sample it by explicit texel index).
             this.targets.setShadowSize(packShadowMapResolution());
             // Same reason as the shadow-map resolution above: shadowDistance is a live slider in the shader options
-            // screen and it drives the pack's shadow distortion bias. Sampled ONCE per frame — the two consumers
-            // (applyTerrainUniforms, usePlayerShadowProgram) run per draw and per caster respectively, and the lookup
-            // is a map get + parse. Both must agree with the pack or shadows land offset, radially about the camera.
-            this.shadowMapBiasThisFrame = packShadowMapBias();
+            // screen, and it drives BOTH the ortho half-extent and the pack's shadow distortion bias. Sampled ONCE
+            // per frame here, before anything that reads the shadow box (computeShadowMatrices, the section culls,
+            // updateShadowRenderList, the entity caster radius) runs later in the same frame.
+            refreshPackShadowGeometry();
             this.targets.resize(w, h);
 
             EntityRenderer er = mc.entityRenderer;
