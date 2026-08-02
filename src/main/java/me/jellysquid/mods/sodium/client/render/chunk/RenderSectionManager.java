@@ -167,7 +167,7 @@ public class RenderSectionManager {
      * A needs √3·8 + 0.00873·673 − 10.14 ≈ 9.6 and B needs 8 + 8 = 16 → 16.0, exactly the constant that was verified
      * in-game. B dominates for every realistic shadow distance; A only overtakes it past ~500 blocks.</p>
      */
-    private static float shadowListMargin() {
+    public static float shadowListMargin() {
         float shadowDistance = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.shadowDistanceBlocks();
         float sectionSlack = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.SHADOW_BOX_SECTION_SLACK;
         float eyePullback = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.SHADOW_EYE_PULLBACK;

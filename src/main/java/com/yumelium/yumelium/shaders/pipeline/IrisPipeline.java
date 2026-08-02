@@ -3247,7 +3247,22 @@ public final class IrisPipeline {
         }
         this.shadowDistanceThisFrame = d;
         this.shadowMapBiasThisFrame = 1.0F - 25.6F / d;
+
+        // Log on CHANGE, not on shadow-map allocation: the map is only reallocated when its RESOLUTION changes
+        // (SHADOW_QUALITY / SHADOW_SMOOTHING), so moving the shadowDistance slider alone leaves no trace there — which
+        // is exactly what happened during the 2026-08-02 verification session, where the value had to be reconstructed
+        // from the options file's mtime. These four numbers are the whole shadow-box state, and every one of them is
+        // derived rather than written down now, so this is also the cheapest check that the derivation is live.
+        if (d != this.loggedShadowDistance) {
+            this.loggedShadowDistance = d;
+            log(String.format("shadow box: dist %.1fb, bias %.4f, cull extent %.1fb, eye %.1fb, list margin %.2fb",
+                    d, this.shadowMapBiasThisFrame, shadowCullExtent(), shadowEyeDistance(),
+                    me.jellysquid.mods.sodium.client.render.chunk.RenderSectionManager.shadowListMargin()));
+        }
     }
+
+    /** Last shadow distance written to the log — so the line above fires on change, not every frame. */
+    private float loggedShadowDistance = Float.NaN;
 
     /**
      * Reproduces the pack's compile-time {@code const int shadowMapResolution} (common.glsl) from SHADOW_QUALITY +
