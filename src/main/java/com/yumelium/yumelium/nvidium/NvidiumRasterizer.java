@@ -143,6 +143,11 @@ public final class NvidiumRasterizer {
         return this.taskCullActive;
     }
 
+    /** @return the current occlusion stamp clock — used by the M4c readback to report how many frames it lags. */
+    public int currentFrame() {
+        return this.frameCounter;
+    }
+
     private static boolean optionGpuCulling() {
         try {
             return SodiumClientMod.options().yumeliumPlus.nvidiumGpuCulling;
@@ -322,6 +327,10 @@ public final class NvidiumRasterizer {
      */
     private void drawVisibilityBoxes(Matrix4fc projection, Matrix4fc modelView, double camX, double camY, double camZ) {
         NvidiumBackend backend = NvidiumBackend.instance();
+        // M4c: drain any readback whose fence has signalled. Unconditionally, and BEFORE the early return, so a
+        // frame where the box pass does not run (occlusion just switched off, empty visible set) still releases the
+        // syncs left pending by earlier frames.
+        backend.pollVisibilityReadback();
         int instances = backend.boxInstanceCount();
         int instanceBuffer = backend.boxInstanceBufferId();
         if (!this.occlusionActive || instances <= 0 || instanceBuffer == 0) {
@@ -374,6 +383,10 @@ public final class NvidiumRasterizer {
         org.lwjgl.opengl.GL42C.glMemoryBarrier(org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BARRIER_BIT);
         org.lwjgl.opengl.GL30C.glBindBufferBase(org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER,
                 SSBO_BOX_INSTANCES, 0);
+
+        // M4c: snapshot the stamps this pass just wrote into a fenced readback slot. AFTER the barrier so the copy
+        // sources the new values, and non-blocking (the result is collected some later frame by pollVisibilityReadback).
+        backend.captureVisibilityReadback(this.frameCounter);
     }
 
     private void drawPass(int pass, int alphaTest, int translucent) {

@@ -131,6 +131,32 @@ public final class NvidiumBackend {
     /** Increments once per work-item table REBUILD — the clock the per-section "new to the visible set" flag uses. */
     private int buildCounter;
 
+    // --- M4c: async visibility readback (F3 only) -----------------------------------------------------------------
+    // The stamps live only on the GPU, so without this there is no way to see whether occlusion culling is doing
+    // anything. Each frame the stamp range is copied into a ring of readback buffers behind a real fence; a later
+    // frame reads whichever slot has already signalled, so the render thread NEVER blocks on the GPU (the whole point
+    // — the synchronous version of this idea is exactly what stalled the pipeline in the centerDepthSmooth bug).
+    // Purely diagnostic: nothing in the render path reads the result, and no GL work is issued unless F3 is open.
+    private static final int READBACK_SLOTS = 3;
+    private final int[] readbackBuf = new int[READBACK_SLOTS];
+    private final long[] readbackFence = new long[READBACK_SLOTS];
+    private final int[] readbackFrame = new int[READBACK_SLOTS];
+    private final int[] readbackEntries = new int[READBACK_SLOTS];
+    private final int[][] readbackSnapshot = new int[READBACK_SLOTS][];
+    private final int[] readbackSnapshotCount = new int[READBACK_SLOTS];
+    /** Per SLOT, not global: a slot still in flight keeps its own (older, smaller) buffer until it is consumed. */
+    private final long[] readbackBufBytes = new long[READBACK_SLOTS];
+    private int readbackSlot;
+    private int[] stampScratch = new int[4096];
+    /** This build's visIdx list, parallel to the box instances — what the readback is attributed to. */
+    private int[] visIdxSnapshot = new int[512];
+    private int visIdxSnapshotCount;
+    // Last completed probe. probeFrame < 0 = nothing measured yet (F3 just opened, or occlusion off).
+    private int probeFrame = -1;
+    private int probeTested;
+    private int probeOccluded;
+    private int probeLagFrames;
+
     private long cumulativeBytes;
     private long mirrorCalls;
     private boolean arenaFullLogged;
@@ -166,6 +192,18 @@ public final class NvidiumBackend {
                 this.lastFullSort ? "full" : this.lastSortSections ? "sections" : "off"));
         list.add(String.format("mirrored: %d uploads, %.2fGB cumulative", this.mirrorCalls,
                 this.cumulativeBytes / 1073741824.0D));
+        // M4c: what the GPU occlusion test actually decided, read back asynchronously (F3 only). "occluded" is an
+        // UPPER bound — the near-radius and is-new force-draws bypass the stamp before it is ever consulted.
+        if (NvidiumRasterizer.instance().occlusionCullingActive()) {
+            if (this.probeFrame < 0) {
+                list.add("occlusion probe: sampling...");
+            } else {
+                list.add(String.format("occlusion probe: %d/%d occluded (%.1f%%), lag %df",
+                        this.probeOccluded, this.probeTested,
+                        this.probeTested == 0 ? 0.0F : 100.0F * this.probeOccluded / this.probeTested,
+                        this.probeLagFrames));
+            }
+        }
         return list;
     }
 
@@ -303,9 +341,21 @@ public final class NvidiumBackend {
             if (this.sortStaging != null) this.sortStaging.delete();
             if (this.boxStaging != null) this.boxStaging.delete();
             if (this.visBuffer != 0) GL15C.glDeleteBuffers(this.visBuffer);
+            dropVisibilityReadback(); // M4c: syncs first — they may reference the readback buffers below
+            for (int slot = 0; slot < READBACK_SLOTS; slot++) {
+                if (this.readbackBuf[slot] != 0) {
+                    GL15C.glDeleteBuffers(this.readbackBuf[slot]);
+                    this.readbackBuf[slot] = 0;
+                }
+                this.readbackBufBytes[slot] = 0L;
+                this.readbackSnapshotCount[slot] = 0;
+                this.readbackEntries[slot] = 0;
+            }
         } catch (Throwable t) {
             log("reset: buffer delete error: " + t);
         }
+        this.readbackSlot = 0;
+        this.visIdxSnapshotCount = 0;
         this.boxStaging = null;
         this.visBuffer = 0;
         this.visCapacity = 0;
@@ -571,6 +621,9 @@ public final class NvidiumBackend {
         if (occlusion) {
             ensureVisCapacity(this.nextVisIdx);
             ensureBoxCapacity(vis);
+            if (this.visIdxSnapshot.length < vis) {
+                this.visIdxSnapshot = new int[Math.max(vis, this.visIdxSnapshot.length * 2)];
+            }
             long boxBase = this.boxStaging.address() + (long) this.boxSlot * this.boxSlotBytes;
             for (int i = 0; i < vis; i++) {
                 int[] s = this.visibleScratch[i];
@@ -579,12 +632,15 @@ public final class NvidiumBackend {
                 MemoryUtil.memPutInt(p + 4, s[2]);
                 MemoryUtil.memPutInt(p + 8, s[3]);
                 MemoryUtil.memPutInt(p + 12, s[4]);
+                this.visIdxSnapshot[i] = s[S_VIS_IDX]; // M4c: which entries this frame's boxes will stamp
             }
+            this.visIdxSnapshotCount = vis;
             this.boxInstances = vis;
             this.boxOffset = (long) this.boxSlot * this.boxSlotBytes;
             this.boxSlot = (this.boxSlot + 1) % 3;
         } else {
             this.boxInstances = 0;
+            this.visIdxSnapshotCount = 0;
         }
 
         long slotBytes = this.metadataBytes / 3;
@@ -802,6 +858,186 @@ public final class NvidiumBackend {
         this.boxSlot = 0;
         log("box-raster instance table grown to " + (slot * 3L >> 20) + "MB ("
                 + (slot / BOX_INSTANCE_BYTES) + " sections/frame)");
+    }
+
+    // --- M4c: async visibility readback ---------------------------------------------------------------------------
+
+    /** Diagnostic only, so it costs nothing unless the user is actually looking at F3. */
+    private static boolean readbackWanted() {
+        try {
+            net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getMinecraft();
+            return mc != null && mc.gameSettings != null && mc.gameSettings.showDebugInfo;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Consume any readback slot whose fence has already signalled. Non-blocking by construction: {@code
+     * glClientWaitSync} is called with a zero timeout and the buffer is only read on ALREADY_SIGNALED /
+     * CONDITION_SATISFIED, so {@code glGetBufferSubData} can never stall the render thread. Called every frame from
+     * the rasterizer, including on frames where the box pass does not run, so pending syncs are always drained.
+     */
+    public void pollVisibilityReadback() {
+        if (!readbackWanted()) {
+            dropVisibilityReadback(); // F3 closed: release the syncs rather than leaving them pending indefinitely
+            return;
+        }
+        // Free EVERY signalled slot, but read back only the NEWEST of them. Publishing in index order would let an
+        // older sample overwrite a newer one (slot 0 = frame 100, slot 1 = frame 99 → F3 ends up showing 99 and a
+        // lag that jumps backwards), and reading back every signalled slot would do a full buffer read + scan per
+        // slot to then throw all but one away.
+        int now = NvidiumRasterizer.instance().currentFrame();
+        int best = -1;
+        int bestLag = Integer.MAX_VALUE;
+        for (int slot = 0; slot < READBACK_SLOTS; slot++) {
+            long fence = this.readbackFence[slot];
+            if (fence == 0L) {
+                continue;
+            }
+            int status = org.lwjgl.opengl.GL32C.glClientWaitSync(fence, 0, 0L);
+            if (status != org.lwjgl.opengl.GL32C.GL_ALREADY_SIGNALED
+                    && status != org.lwjgl.opengl.GL32C.GL_CONDITION_SATISFIED) {
+                if (status == org.lwjgl.opengl.GL32C.GL_WAIT_FAILED) {
+                    org.lwjgl.opengl.GL32C.glDeleteSync(fence);
+                    this.readbackFence[slot] = 0L;
+                }
+                continue; // still in flight — try again next frame
+            }
+            org.lwjgl.opengl.GL32C.glDeleteSync(fence);
+            this.readbackFence[slot] = 0L;
+            if (this.readbackEntries[slot] <= 0 || this.readbackBuf[slot] == 0) {
+                continue;
+            }
+            // Age, not raw frame number: the clock wraps (and skips 0), so compare the unsigned difference.
+            int lag = this.readbackFrame[slot] == 0 ? Integer.MAX_VALUE : now - this.readbackFrame[slot];
+            if (lag >= 0 && lag < bestLag) {
+                bestLag = lag;
+                best = slot;
+            }
+        }
+        if (best < 0) {
+            return;
+        }
+
+        int entries = this.readbackEntries[best];
+        // The int[] overload reads exactly data.length ints, so the scratch must MATCH the captured size, not
+        // merely be big enough. Reallocated only when the size actually changes, so it is not per-frame garbage.
+        if (this.stampScratch.length != entries) {
+            this.stampScratch = new int[entries];
+        }
+        int[] dst = this.stampScratch;
+        GL15C.glBindBuffer(org.lwjgl.opengl.GL31C.GL_COPY_READ_BUFFER, this.readbackBuf[best]);
+        GL15C.glGetBufferSubData(org.lwjgl.opengl.GL31C.GL_COPY_READ_BUFFER, 0L, dst);
+        GL15C.glBindBuffer(org.lwjgl.opengl.GL31C.GL_COPY_READ_BUFFER, 0);
+
+        int frame = this.readbackFrame[best];
+        int[] snap = this.readbackSnapshot[best];
+        int n = this.readbackSnapshotCount[best];
+        int occluded = 0;
+        int tested = 0;
+        for (int i = 0; i < n; i++) {
+            int idx = snap[i];
+            if (idx < 0 || idx >= entries) {
+                continue; // the buffer grew after this capture — not attributable, skip
+            }
+            tested++;
+            int stamp = dst[idx];
+            // EXACTLY the shader's predicate (uint arithmetic, so compare the difference unsigned):
+            //     visible = (stamp == 0u) || (u_Frame - stamp <= 2u)
+            // What this cannot see is the near-radius and is-new force-draws, which are decided before the stamp is
+            // ever consulted — so the reported "occluded" is an UPPER bound on what the GPU actually skips. A visIdx
+            // freed and reallocated to a different section between capture and consume is likewise mis-attributed;
+            // both are acceptable in a diagnostic that nothing in the render path reads.
+            boolean visible = stamp == 0 || Integer.compareUnsigned(frame - stamp, 2) <= 0;
+            if (!visible) {
+                occluded++;
+            }
+        }
+        this.probeFrame = frame;
+        this.probeTested = tested;
+        this.probeOccluded = occluded;
+        this.probeLagFrames = bestLag;
+    }
+
+    /**
+     * Copy the live stamp range into a free readback slot and fence it. Must be called AFTER the box pass's
+     * {@code glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)} so the copy source is the stamps this frame just wrote.
+     * If every slot is still in flight the capture is simply skipped — dropping a diagnostic sample is always
+     * preferable to waiting on the GPU.
+     */
+    public void captureVisibilityReadback(int frame) {
+        if (!readbackWanted() || this.visBuffer == 0 || this.visIdxSnapshotCount <= 0) {
+            return;
+        }
+        int slot = -1;
+        for (int i = 0; i < READBACK_SLOTS; i++) {
+            int s = (this.readbackSlot + i) % READBACK_SLOTS;
+            if (this.readbackFence[s] == 0L) {
+                slot = s;
+                break;
+            }
+        }
+        if (slot < 0) {
+            return; // all slots pending; skip this sample
+        }
+        this.readbackSlot = (slot + 1) % READBACK_SLOTS;
+
+        long bytes = (long) this.visCapacity * 4L;
+        if (this.readbackBuf[slot] == 0 || this.readbackBufBytes[slot] != bytes) {
+            // Sized PER SLOT. A single shared size field would be wrong: after visCapacity grows, the slot resized
+            // first would make the shared field match, and the still-pending slots would keep their smaller buffers
+            // while the check passed — glCopyBufferSubData into an undersized buffer is GL_INVALID_VALUE.
+            // Recreating here is safe because this slot has no fence outstanding (that is how it was chosen).
+            if (this.readbackBuf[slot] != 0) {
+                GL15C.glDeleteBuffers(this.readbackBuf[slot]);
+            }
+            this.readbackBuf[slot] = GL15C.glGenBuffers();
+            GL15C.glBindBuffer(org.lwjgl.opengl.GL31C.GL_COPY_WRITE_BUFFER, this.readbackBuf[slot]);
+            GL15C.glBufferData(org.lwjgl.opengl.GL31C.GL_COPY_WRITE_BUFFER, bytes, GL15C.GL_STREAM_READ);
+            GL15C.glBindBuffer(org.lwjgl.opengl.GL31C.GL_COPY_WRITE_BUFFER, 0);
+            this.readbackBufBytes[slot] = bytes;
+        }
+
+        // The caller's glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT) orders the stamps for the SHADER consumers
+        // (the task/mesh cull) — it does NOT order a subsequent glCopyBufferSubData. Per the spec that read needs
+        // GL_BUFFER_UPDATE_BARRIER_BIT ("reads via glCopyBufferSubData after the barrier reflect data written by
+        // shaders before it"). Without it the copy may source pre-barrier values and the probe over-reports
+        // occlusion. Issued here rather than in the box pass so the non-diagnostic path pays nothing for it.
+        org.lwjgl.opengl.GL42C.glMemoryBarrier(org.lwjgl.opengl.GL42C.GL_BUFFER_UPDATE_BARRIER_BIT);
+
+        // GL_COPY_READ_BUFFER / GL_COPY_WRITE_BUFFER exist precisely so a copy cannot disturb any binding the
+        // renderer cares about, and GlStateManager does not cache either target — no state-desync hazard here.
+        GL15C.glBindBuffer(org.lwjgl.opengl.GL31C.GL_COPY_READ_BUFFER, this.visBuffer);
+        GL15C.glBindBuffer(org.lwjgl.opengl.GL31C.GL_COPY_WRITE_BUFFER, this.readbackBuf[slot]);
+        org.lwjgl.opengl.GL31C.glCopyBufferSubData(org.lwjgl.opengl.GL31C.GL_COPY_READ_BUFFER,
+                org.lwjgl.opengl.GL31C.GL_COPY_WRITE_BUFFER, 0L, 0L, bytes);
+        GL15C.glBindBuffer(org.lwjgl.opengl.GL31C.GL_COPY_READ_BUFFER, 0);
+        GL15C.glBindBuffer(org.lwjgl.opengl.GL31C.GL_COPY_WRITE_BUFFER, 0);
+
+        int n = this.visIdxSnapshotCount;
+        int[] snap = this.readbackSnapshot[slot];
+        if (snap == null || snap.length < n) {
+            snap = new int[Math.max(n, 512)];
+            this.readbackSnapshot[slot] = snap;
+        }
+        System.arraycopy(this.visIdxSnapshot, 0, snap, 0, n);
+        this.readbackSnapshotCount[slot] = n;
+        this.readbackEntries[slot] = this.visCapacity;
+        this.readbackFrame[slot] = frame;
+        this.readbackFence[slot] = org.lwjgl.opengl.GL32C.glFenceSync(
+                org.lwjgl.opengl.GL32C.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    }
+
+    /** Release pending syncs and forget the last sample (F3 closed, renderer reload, occlusion switched off). */
+    private void dropVisibilityReadback() {
+        for (int slot = 0; slot < READBACK_SLOTS; slot++) {
+            if (this.readbackFence[slot] != 0L) {
+                org.lwjgl.opengl.GL32C.glDeleteSync(this.readbackFence[slot]);
+                this.readbackFence[slot] = 0L;
+            }
+        }
+        this.probeFrame = -1;
     }
 
     /** @return the visibility stamp SSBO (0 when not allocated), read by the task shader and written by the boxes. */
