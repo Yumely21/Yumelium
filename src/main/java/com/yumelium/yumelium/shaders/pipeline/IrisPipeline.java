@@ -1151,6 +1151,71 @@ public final class IrisPipeline {
         this.shadowEntTesrNanos += System.nanoTime() - t;
     }
 
+    // --- per-entity-CLASS cost attribution ------------------------------------------------------------------------
+    // "A single Sludge Menace up close tanks the frame" is a claim about ONE renderer, and nothing measured so far
+    // can name it: the phase timers give totals, and the class counters give counts, never time-per-class. These
+    // accumulate wall-clock per entity class per pass so the log can say which mob costs what, in which pass.
+    // Compile-time gated — two nanoTime calls per entity is fine while investigating, not in a shipping build.
+    public static final boolean DIAG_ENTITY_COST = true;
+    private final java.util.Map<Class<?>, long[]> entityCostCamera = new java.util.HashMap<>();
+    private final java.util.Map<Class<?>, long[]> entityCostShadow = new java.util.HashMap<>();
+    private int entityCostFrames;
+
+    /** @param shadow true for the shadow caster pass, false for the camera pass. */
+    public void recordEntityCost(Class<?> cls, long startNanos, boolean shadow) {
+        if (!DIAG_ENTITY_COST) {
+            return;
+        }
+        long dt = System.nanoTime() - startNanos;
+        java.util.Map<Class<?>, long[]> m = shadow ? this.entityCostShadow : this.entityCostCamera;
+        long[] slot = m.get(cls);
+        if (slot == null) {
+            slot = new long[2]; // [0] = total nanos, [1] = invocation count
+            m.put(cls, slot);
+        }
+        slot[0] += dt;
+        slot[1]++;
+    }
+
+    /** Logs the costliest entity classes across the accumulation window, then clears it. */
+    private void reportEntityCost() {
+        this.entityCostFrames++;
+        if (this.entityCostFrames < 120) { // ~2 s of accumulation, so one-off spikes do not dominate
+            return;
+        }
+        int frames = this.entityCostFrames;
+        this.entityCostFrames = 0;
+        logEntityCostHalf("camera", this.entityCostCamera, frames);
+        logEntityCostHalf("shadow", this.entityCostShadow, frames);
+        this.entityCostCamera.clear();
+        this.entityCostShadow.clear();
+    }
+
+    private static void logEntityCostHalf(String pass, java.util.Map<Class<?>, long[]> m, int frames) {
+        if (m.isEmpty()) {
+            return;
+        }
+        java.util.List<java.util.Map.Entry<Class<?>, long[]>> top = new java.util.ArrayList<>(m.entrySet());
+        top.sort((a, b) -> Long.compare(b.getValue()[0], a.getValue()[0]));
+        StringBuilder sb = new StringBuilder("[ENTITY COST/").append(pass).append("] per frame:");
+        double totalMs = 0.0;
+        for (java.util.Map.Entry<Class<?>, long[]> e : top) {
+            totalMs += e.getValue()[0] / 1.0e6 / frames;
+        }
+        int shown = 0;
+        for (java.util.Map.Entry<Class<?>, long[]> e : top) {
+            if (shown++ >= 8) {
+                break;
+            }
+            double msPerFrame = e.getValue()[0] / 1.0e6 / frames;
+            double perCall = e.getValue()[1] == 0 ? 0.0 : e.getValue()[0] / 1.0e3 / e.getValue()[1];
+            sb.append(String.format(" %s=%.2fms(n=%.0f/f, %.0fus each)", e.getKey().getSimpleName(),
+                    msPerFrame, e.getValue()[1] / (double) frames, perCall));
+        }
+        sb.append(String.format(" | pass total=%.2fms/frame over %d classes", totalMs, m.size()));
+        log(sb.toString());
+    }
+
     /** Entity counts for the GPU TIME line: shadow casters actually drawn, and the leash-gate tallies. */
     private String entityDiagSuffix() {
         try {
@@ -6308,6 +6373,9 @@ public final class IrisPipeline {
                 this.healthReported = false; // re-arm: toggling OFF→ON prints a fresh report
             }
 
+            if (DIAG_ENTITY_COST) {
+                reportEntityCost();
+            }
             // Harvest the GPU timers issued a few frames back and report the breakdown ~1/second.
             this.profiler.frameEnd();
             if (DIAG_GPU_TIME && this.frameCounter % 60 == 0) {

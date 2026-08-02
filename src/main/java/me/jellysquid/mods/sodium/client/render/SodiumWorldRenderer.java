@@ -501,6 +501,143 @@ public class SodiumWorldRenderer {
      * viewer info is cached with THIS frame's camera so each entity lands at its camera-relative world position,
      * which the shadow model-view then maps to light space.
      */
+    /** Set once a caster failure has been reported, so a renderer that throws every frame logs once, not 60x/s. */
+    private boolean iris$casterFailureLogged;
+    /** As above, for the "arrived with a dirty Tessellator" report. */
+    private boolean iris$dirtyTessellatorLogged;
+    /** Classes already named as leaking a Tessellator build, so each is reported once. */
+    private final java.util.Set<Class<?>> iris$leakingCasters = new java.util.HashSet<>();
+
+    /**
+     * Caster classes whose renderer threw in the shadow pass; never attempted again this session.
+     *
+     * <p>Catching and continuing is not enough. The throw itself is expensive — building a {@code ReportedException}
+     * captures a stack trace — and it happens for EVERY instance of that class on EVERY frame. Observed 2026-08-03:
+     * a Betweenlands spike-trap TESR failing this way dragged the frame rate down far enough that a 120-frame
+     * diagnostic accumulator never completed in 70 seconds of play. It also re-corrupts the shared Tessellator each
+     * time, so the recovery ran every frame too.</p>
+     *
+     * <p>A renderer that cannot draw into the light-POV pass will not start working later, so retrying it forever
+     * buys nothing. The cost of giving up is that this class casts no shadow — which was already true, since the
+     * draw threw. Keyed by class, not instance: the failure is in the renderer, shared by every instance.</p>
+     */
+    private final java.util.Set<Class<?>> iris$brokenCasters = new java.util.HashSet<>();
+
+    /**
+     * Probe RIGHT AFTER one caster drew, so a renderer that leaks a build without throwing is named instead of
+     * merely inferred. This is the only way to identify it: the leak is silent at the source and the exception
+     * surfaces on whoever calls begin() next. Gated on DIAG_ENTITY_COST — one probe per caster is a debugging cost.
+     */
+    private void iris$checkCasterLeak(Class<?> casterClass) {
+        if (!com.yumelium.yumelium.shaders.pipeline.IrisPipeline.DIAG_ENTITY_COST) {
+            return;
+        }
+        boolean dirty = false;
+        try {
+            net.minecraft.client.renderer.BufferBuilder buffer =
+                    net.minecraft.client.renderer.Tessellator.getInstance().getBuffer();
+            try {
+                buffer.finishDrawing();
+                dirty = true;
+            } catch (Throwable ignored) {
+                // clean
+            }
+            if (dirty) {
+                buffer.reset();
+            }
+        } catch (Throwable ignored) {
+            // never break the pass over a diagnostic
+        }
+        if (dirty && this.iris$leakingCasters.add(casterClass)) {
+            SodiumClientMod.logger().warn("[Iris shadow] LEAK: " + casterClass.getName()
+                    + " returned with the Tessellator still mid-build (begin() without draw()). Discarded.");
+        }
+    }
+
+    /**
+     * Ensure the shared Tessellator is not mid-build, and say so once if it was.
+     *
+     * <p>A renderer that calls {@code BufferBuilder.begin()} and returns without {@code draw()} leaks the build with
+     * NO exception, so the per-caster catch never sees it — the damage only surfaces later, as
+     * {@code Already building!} thrown at whoever calls begin() next. That victim then looks like the culprit
+     * (2026-08-03: a Betweenlands spike-trap TESR, and before it their particle batcher, both innocent).</p>
+     *
+     * <p>There is no public {@code isDrawing} getter, so the probe IS the repair: {@code finishDrawing()} throws
+     * "Not building!" when the buffer is clean, and succeeds exactly when it was dirty.</p>
+     *
+     * @return true if a leaked build was found and discarded
+     */
+    private boolean iris$ensureCleanTessellator(String where) {
+        boolean wasDirty = false;
+        try {
+            net.minecraft.client.renderer.BufferBuilder buffer =
+                    net.minecraft.client.renderer.Tessellator.getInstance().getBuffer();
+            try {
+                buffer.finishDrawing();
+                wasDirty = true; // no throw => it really was mid-build
+            } catch (Throwable ignored) {
+                // clean; nothing to do
+            }
+            if (wasDirty) {
+                buffer.reset();
+            }
+        } catch (Throwable ignored) {
+            // never let the check itself break the pass
+        }
+        if (wasDirty && !this.iris$dirtyTessellatorLogged) {
+            this.iris$dirtyTessellatorLogged = true;
+            SodiumClientMod.logger().warn("[Iris shadow] the shared Tessellator was already mid-build on entry to "
+                    + where + " — some renderer called BufferBuilder.begin() without draw(). Discarded the partial "
+                    + "build so it cannot cascade. Not logged again this session.");
+        }
+        return wasDirty;
+    }
+
+    /**
+     * Repair the shared draw state after a shadow caster's renderer threw.
+     *
+     * <p>Swallowing the exception keeps one bad renderer from aborting the pass, but it does NOT undo what that
+     * renderer had already done — and an immediate-mode renderer that throws between {@code BufferBuilder.begin()}
+     * and {@code Tessellator.draw()} leaves the SHARED Tessellator mid-build. Everything downstream that touches it
+     * then dies with {@code IllegalStateException: Already building!}, and the first victim is whoever happens to be
+     * next — observed 2026-08-03 as Betweenlands' BatchedParticleRenderer blowing up in RenderWorldLastEvent, an
+     * innocent bystander several stages later. The real failure was invisible: `failed` is only surfaced under
+     * DIAG_ENTITY_SHADOW.</p>
+     *
+     * <p>So: discard any partial build (finishDrawing clears the flag, reset drops the vertices — partial geometry
+     * must NOT be drawn), and log the first failure per session at WARN. A swallowed exception that corrupts global
+     * state is not a silent condition.</p>
+     */
+    private void iris$recoverFromCasterFailure(Class<?> casterClass, Throwable cause) {
+        try {
+            net.minecraft.client.renderer.BufferBuilder buffer =
+                    net.minecraft.client.renderer.Tessellator.getInstance().getBuffer();
+            try {
+                buffer.finishDrawing(); // throws "Not building!" when it was already clean — that case is fine
+            } catch (Throwable ignored) {
+                // not mid-build; nothing to unwind
+            }
+            buffer.reset();
+        } catch (Throwable ignored) {
+            // never let the recovery itself break the pass
+        }
+        // Give up on this class permanently — see iris$brokenCasters for why retrying is actively harmful.
+        boolean firstForClass = this.iris$brokenCasters.add(casterClass);
+        if (firstForClass) {
+            SodiumClientMod.logger().warn("[Iris shadow] caster renderer failed: " + casterClass.getName()
+                    + " — shared draw state reset, and this class is now EXCLUDED from the shadow pass for the rest "
+                    + "of the session (it casts no shadow). Retrying every frame costs a stack trace per instance "
+                    + "per frame and re-corrupts the shared Tessellator.",
+                    this.iris$casterFailureLogged ? null : cause);
+            this.iris$casterFailureLogged = true;
+        }
+    }
+
+    /** @return true if this caster class has already failed once and must not be attempted again. */
+    private boolean iris$isBrokenCaster(Class<?> casterClass) {
+        return !this.iris$brokenCasters.isEmpty() && this.iris$brokenCasters.contains(casterClass);
+    }
+
     private void drawEntityShadowCasters(ChunkRenderMatrices matrices, double x, double y, double z, boolean allEntities, boolean entityCasters) {
         Minecraft mc = this.client;
         Entity view = mc.getRenderViewEntity();
@@ -512,6 +649,9 @@ public class SodiumWorldRenderer {
         // DIAGNOSTIC: split this pass's CPU cost into setup / draws / TESR sweep — it measured ~7 ms while drawing a
         // single entity for 0.00 ms of GPU, and did not move with the entity count.
         final long iris$tSetup = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().entityCpuMark();
+        // Do not inherit a leaked build from earlier in the frame: our casters are immediate-mode draws, so a dirty
+        // Tessellator would make the FIRST of them throw and look like the culprit.
+        iris$ensureCleanTessellator("the entity shadow pass");
 
         // Light-POV fixed-function matrices; the distortion program warps on top of them.
         GlStateManager.matrixMode(GL11.GL_PROJECTION);
@@ -605,6 +745,9 @@ public class SodiumWorldRenderer {
                     if (entity == null || entity instanceof net.minecraft.entity.effect.EntityLightningBolt) {
                         continue;
                     }
+                    if (iris$isBrokenCaster(entity.getClass())) {
+                        continue; // its renderer already threw once — see iris$brokenCasters
+                    }
                     double dx = entity.posX - x, dy = entity.posY - y, dz = entity.posZ - z;
                     if (dx * dx + dy * dy + dz * dz > cullSq) {
                         culled++;
@@ -640,9 +783,15 @@ public class SodiumWorldRenderer {
                         // EntityCulling compat: lift a camera-occlusion cull for the SHADOW draw (the sun's view is
                         // not the camera's), restore right after — see EntityCullingCompat.
                         boolean iris$recull = com.yumelium.yumelium.compat.EntityCullingCompat.beginShadowDraw(entity);
+                        long iris$t0 = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.DIAG_ENTITY_COST
+                                ? System.nanoTime() : 0L;
                         try {
                             renderManager.renderEntityStatic(entity, partialTicks, false);
                         } finally {
+                            if (com.yumelium.yumelium.shaders.pipeline.IrisPipeline.DIAG_ENTITY_COST) {
+                                com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance()
+                                        .recordEntityCost(entity.getClass(), iris$t0, true);
+                            }
                             if (iris$recull) {
                                 com.yumelium.yumelium.compat.EntityCullingCompat.endShadowDraw(entity);
                             }
@@ -654,6 +803,7 @@ public class SodiumWorldRenderer {
                             SodiumClientMod.logger().info("[Iris shadow][ENT-STATE] post #" + drawn + " "
                                     + entity.getClass().getSimpleName() + (d.isEmpty() ? " clean" : " " + d));
                         }
+                        iris$checkCasterLeak(entity.getClass());
                         drawn++;
                         if (classes != null) {
                             classes.merge(entity.getClass().getSimpleName(), 1, Integer::sum);
@@ -665,6 +815,7 @@ public class SodiumWorldRenderer {
                         if (failMsg == null) {
                             failMsg = entity.getClass().getSimpleName() + ": " + t;
                         }
+                        iris$recoverFromCasterFailure(entity.getClass(), t);
                     }
                 }
                 if (logNow) {
@@ -708,6 +859,9 @@ public class SodiumWorldRenderer {
                     if (dispatcher.getRenderer(te) == null) {
                         continue;
                     }
+                    if (iris$isBrokenCaster(te.getClass())) {
+                        continue; // its renderer already threw once — see iris$brokenCasters
+                    }
                     try {
                         com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().usePlayerShadowProgram();
                         com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().reassertShadowFboState();
@@ -725,12 +879,14 @@ public class SodiumWorldRenderer {
                                 com.yumelium.yumelium.compat.EntityCullingCompat.endShadowDraw(te);
                             }
                         }
+                        iris$checkCasterLeak(te.getClass());
                         drawnTe++;
                     } catch (Throwable t) {
                         failedTe++;
                         if (failTeMsg == null) {
                             failTeMsg = te.getClass().getSimpleName() + ": " + t;
                         }
+                        iris$recoverFromCasterFailure(te.getClass(), t);
                     }
                 }
                 if (logNow) {

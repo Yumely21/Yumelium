@@ -177,7 +177,13 @@ public abstract class MixinRenderGlobal {
             if ((entity != renderViewEntity || yumelium$thirdPerson || yumelium$isSleeping)
                     && (entity.posY < 0.0D || entity.posY >= 256.0D || this.world.isBlockLoaded(entityBlockPos.setPos(entity)))) {
                 ++this.countEntitiesRendered;
-                this.renderManager.renderEntityStatic(entity, partialTicks, false);
+                if (IrisPipeline.DIAG_ENTITY_COST) {
+                    long yumelium$t0 = System.nanoTime();
+                    this.renderManager.renderEntityStatic(entity, partialTicks, false);
+                    IrisPipeline.instance().recordEntityCost(entity.getClass(), yumelium$t0, false);
+                } else {
+                    this.renderManager.renderEntityStatic(entity, partialTicks, false);
+                }
 
                 if (this.isOutlineActive(entity, renderViewEntity, camera)) {
                     outlineEntityList.add(entity);
