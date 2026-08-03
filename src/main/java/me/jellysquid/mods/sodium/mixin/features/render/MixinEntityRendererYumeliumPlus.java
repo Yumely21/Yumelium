@@ -17,6 +17,36 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  */
 @Mixin(EntityRenderer.class)
 public class MixinEntityRendererYumeliumPlus {
+    @org.spongepowered.asm.mixin.Shadow
+    private float farPlaneDistance;
+
+    /**
+     * Floor for the PROJECTION far plane. Vanilla clips at {@code farPlaneDistance * SQRT_2} = rd·16·√2 — at rd2
+     * that is ~45 blocks, which slices through the farthest loaded chunk ring (horizontal corner 32√2 ≈ 45, and any
+     * tall terrain sooner). Fog is designed to hide that cut, so with the Yumelium Plus fog toggle OFF it is plainly
+     * visible (user report 2026-08-03, "since the beginning, Sodium and Nvidium alike"). 288 covers the full loaded
+     * volume at small render distances (√(48² + 48² + 256²) ≈ 265); the floor is inert from rd 13 up
+     * (rd·16·√2 ≥ 288 ⟺ rd ≥ 12.7), so normal render distances keep vanilla numbers exactly.
+     */
+    private static final float YUMELIUM$MIN_PROJECTION_FAR = 288.0F;
+
+    /**
+     * Applies the floor by redirecting the {@code MathHelper.SQRT_2} read in the three places that build/restore the
+     * WORLD projection with {@code farPlaneDistance * SQRT_2}: {@code setupCameraTransform} (the projection itself)
+     * and the restores in {@code renderWorldPass}/{@code renderCloudsCheck} after the cloud pass — all three must
+     * agree or the projection changes mid-frame. Deliberately NOT the {@code farPlaneDistance} field: fog placement
+     * derives from it, and pushing fog out past the loaded world would re-expose the very cut this hides.
+     * {@code renderHand}'s non-√2 projection (near geometry only) is untouched.
+     */
+    @Redirect(method = {"setupCameraTransform", "renderWorldPass", "renderCloudsCheck"},
+            at = @At(value = "FIELD", target = "Lnet/minecraft/util/math/MathHelper;SQRT_2:F",
+                    opcode = org.objectweb.asm.Opcodes.GETSTATIC),
+            require = 3)
+    private float yumelium$floorProjectionFar() {
+        return Math.max(net.minecraft.util.math.MathHelper.SQRT_2,
+                YUMELIUM$MIN_PROJECTION_FAR / Math.max(this.farPlaneDistance, 1.0F));
+    }
+
     @Inject(method = "renderRainSnow", at = @At("HEAD"), cancellable = true)
     private void yumelium$toggleWeather(float partialTicks, CallbackInfo ci) {
         if (!SodiumClientMod.options().yumeliumPlus.renderWeather) {
