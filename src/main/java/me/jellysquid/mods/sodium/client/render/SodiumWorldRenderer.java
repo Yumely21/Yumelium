@@ -808,6 +808,12 @@ public class SodiumWorldRenderer {
                     if (entity == null || entity instanceof net.minecraft.entity.effect.EntityLightningBolt) {
                         continue;
                     }
+                    // Sludge Menace DummyPart: pure re-dispatch overhead — the parent boss is in this same list
+                    // under the same distance cull, and the salted guard dedups the body draw. Skipping the 17
+                    // dummies saves 17 per-caster brackets + Frustum builds per boss per pass (task #15).
+                    if (com.yumelium.yumelium.compat.BetweenlandsCompat.isSludgeMenaceDummy(entity)) {
+                        continue;
+                    }
                     if (iris$isBrokenCaster(entity.getClass())) {
                         continue; // already threw once — see iris$brokenCasters
                     }

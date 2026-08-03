@@ -173,6 +173,16 @@ public abstract class MixinRenderGlobal {
                     && ((yumelium$diagBossCounter++ & 0x1F) == 0);
             final String yumelium$diagCls = yumelium$diagBoss ? entity.getClass().getSimpleName() : null;
 
+            // Sludge Menace DummyPart skip (task #15): the boss keeps renderBoundingBox = the union of all 17 part
+            // AABBs (client side, bytecode-verified), so the PARENT passes the gates below whenever any part is
+            // visible, and the salted guard dedups the body draw — each dummy dispatch is pure overhead (our
+            // bracket x2 + BL's new Frustum() = 2 glGetFloat + nested parent re-dispatch). Skipping here also keeps
+            // them out of the multipass list (their delegateRender(multipass) was a no-op anyway:
+            // RenderSludgeMenace.isMultipass() is false). See BetweenlandsCompat.isSludgeMenaceDummy.
+            if (com.yumelium.yumelium.compat.BetweenlandsCompat.isSludgeMenaceDummy(entity)) {
+                continue;
+            }
+
             // Skip entities that shouldn't render in this pass
             if (!entity.shouldRenderInPass(pass)) {
                 if (yumelium$diagBoss) {
