@@ -504,8 +504,18 @@ public final class TerrainShaderTransformer {
         // the anchor loses only this hardening, and the miss is logged loudly below.
         if ("terrain".equals(what)) {
             String anchor = "if (color.a <= 0.00001) discard; // 6WIR4HT23";
+            // With ANISOTROPIC_FILTER on, `color` came from the pack's textureAF, which boosts every sample's alpha
+            // with sqrt() ("Tweak to make cutout blocks look fuller in the distance") — so color.a ≈ avg(sqrt(raw)),
+            // and a modded texture's raw-0.02 "transparent" texel arrives here as ~0.14, sailing over the 0.1 cutoff
+            // that kills it in every other renderer. Compare the SQUARE under AF to undo the boost and test the
+            // effective raw alpha; without AF, color.a IS the raw alpha and is compared directly.
             String replaced = body.replace(anchor,
-                    "if (color.a <= max(0.00001, iris_AlphaCutoff)) discard; // 6WIR4HT23 [+ yumelium per-material cutoff]");
+                    "\n"
+                    + "#if ANISOTROPIC_FILTER == 0\n"
+                    + "    if (color.a <= max(0.00001, iris_AlphaCutoff)) discard; // 6WIR4HT23 [+ yumelium per-material cutoff]\n"
+                    + "#else\n"
+                    + "    if (color.a * color.a <= max(0.00001, iris_AlphaCutoff)) discard; // 6WIR4HT23 [+ yumelium per-material cutoff; textureAF sqrt-boost undone]\n"
+                    + "#endif\n");
             if (replaced.equals(body)) {
                 me.jellysquid.mods.sodium.client.SodiumClientMod.logger().warn(
                         "[Yumelium] terrain alpha-cutoff anchor MISSING (pack updated?) — low-alpha 'transparent' texels"
