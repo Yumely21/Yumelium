@@ -127,6 +127,18 @@ public class SmoothLightPipeline implements LightPipeline {
      * Flags: !IS_ALIGNED, IS_PARALLEL
      */
     private void applyParallelFace(AoNeighborInfo neighborInfo, ModelQuadView quad, BlockPos pos, EnumFacing dir, QuadLightData out) {
+        // 1.12.2 PORT FIX (2026-08-03): the inset blend below leans on the light stored in the quad's OWN cell — a
+        // MODERN-MC assumption. Since 1.14, non-full blocks hold propagated light, so blending toward the self cell is
+        // correct there (and this code is inherited verbatim from embeddium-16.5). In 1.12.2, a block with
+        // lightOpacity > 0 stores light 0 no matter what shines on it, so for deeply inset quads inside such a block
+        // the blend converges on pitch black: the Betweenlands' mud-brick alcove (a niche model with
+        // setLightOpacity(255)) rendered its interior black beside a torch. Vanilla 1.12.2's smooth lighting never
+        // reads the self cell — it ALWAYS samples the face's neighbor — which accidentally models light entering the
+        // opening. When the self cell cannot hold light (unpackOP false: opaque-to-light), fall back to exactly that
+        // vanilla behaviour; cells that do hold light keep the modern blend (it is what farmland/path shading was
+        // verified with).
+        boolean selfCellHoldsLight = LightDataAccess.unpackOP(this.lightCache.get(pos));
+
         for (int i = 0; i < 4; i++) {
             // Clamp the vertex positions to the block's boundaries to prevent weird errors in lighting
             float cx = clamp(quad.getX(i));
@@ -135,6 +147,11 @@ public class SmoothLightPipeline implements LightPipeline {
 
             float[] weights = this.weights;
             neighborInfo.calculateCornerWeights(cx, cy, cz, weights);
+
+            if (!selfCellHoldsLight) {
+                this.applyAlignedPartialFaceVertex(pos, dir, weights, i, out, true); // vanilla 1.12.2: offset always
+                continue;
+            }
 
             float depth = neighborInfo.getDepth(cx, cy, cz);
 
@@ -154,6 +171,10 @@ public class SmoothLightPipeline implements LightPipeline {
      * Flags: !IS_ALIGNED, !IS_PARALLEL
      */
     private void applyNonParallelFace(AoNeighborInfo neighborInfo, ModelQuadView quad, BlockPos pos, EnumFacing dir, QuadLightData out) {
+        // Same 1.12.2 port fix as applyParallelFace: an opaque-to-light self cell stores no light in this version,
+        // so never blend toward it — sample the face's neighbor like vanilla 1.12.2 does.
+        boolean selfCellHoldsLight = LightDataAccess.unpackOP(this.lightCache.get(pos));
+
         for (int i = 0; i < 4; i++) {
             // Clamp the vertex positions to the block's boundaries to prevent weird errors in lighting
             float cx = clamp(quad.getX(i));
@@ -166,7 +187,7 @@ public class SmoothLightPipeline implements LightPipeline {
             float depth = neighborInfo.getDepth(cx, cy, cz);
 
             // If the quad is approximately grid-aligned (not inset), avoid unnecessary computation by treating it is as aligned
-            if (MathHelper.epsilonEquals(depth, 0.0F)) {
+            if (MathHelper.epsilonEquals(depth, 0.0F) || !selfCellHoldsLight) {
                 this.applyAlignedPartialFaceVertex(pos, dir, weights, i, out, true);
             } else if (MathHelper.epsilonEquals(depth, 1.0F)) {
                 this.applyAlignedPartialFaceVertex(pos, dir, weights, i, out, false);
