@@ -1318,7 +1318,7 @@ public final class IrisPipeline {
             "gcolor", "gnormal", "composite", "gaux1", "gaux2", "gaux3", "gaux4",
             "depthtex0", "depthtex1", "depthtex2", "depthtex", "gdepth",
             "shadowtex0", "shadowtex1", "shadow", "watershadow", "shadowcolor0", "shadowcolor1",
-            "noisetex", "gtexture", "tex", "lightmap", "renderStage", "yl_ItemLightDir0", "yl_ItemLightDir1", "yl_UndergroundSurfaceY", "textureAtlas",
+            "noisetex", "gtexture", "tex", "lightmap", "renderStage", "yl_ItemLightDir0", "yl_ItemLightDir1", "yl_UndergroundSurfaceY", "yl_EyeSkylightRaw", "textureAtlas",
             "specular", "normals",
         };
         java.util.Collections.addAll(PROVIDED_UNIFORMS, names);
@@ -1747,6 +1747,10 @@ public final class IrisPipeline {
             replaced = replaced.replace("void DoLighting(inout vec4 color",
                     "uniform float yl_UndergroundSurfaceY;\nvoid DoLighting(inout vec4 color");
         }
+        if (!replaced.contains("uniform float yl_EyeSkylightRaw;")) {
+            replaced = replaced.replace("void DoLighting(inout vec4 color",
+                    "uniform float yl_EyeSkylightRaw;\nvoid DoLighting(inout vec4 color");
+        }
         String verdict = "shadowMult *= GetShadow(shadowPos, lightmap.y, offset, shadowSamples, leaves, playerPos);";
         boolean tintMode = me.jellysquid.mods.sodium.client.SodiumClientMod.debugLogs();
         if (!tintMode) {
@@ -1756,8 +1760,9 @@ public final class IrisPipeline {
                 return replaced;
             }
             replaced = replaced.replace(verdict, verdict
-                    + " if ((playerPos.y + cameraPosition.y) < yl_UndergroundSurfaceY) shadowMult *= eyeBrightnessM;"
-                    + " // [yumelium] underground gate: an in-range LIT verdict is untrustworthy when the up-sun column may be unloaded");
+                    + " if ((playerPos.y + cameraPosition.y) < yl_UndergroundSurfaceY) shadowMult *= yl_EyeSkylightRaw;"
+                    + " // [yumelium] underground gate: an in-range LIT verdict is untrustworthy when the up-sun column may be unloaded"
+                    + " (RAW eye skylight, not eyeBrightnessM — the 5s smoothing read as a slowly-fading dash)");
         } else {
             String tintAnchor = "shadowMult *= max(NdotLM * shadowTime, 0.0);";
             if (!replaced.contains(tintAnchor)) {
@@ -7642,6 +7647,11 @@ public final class IrisPipeline {
         // eyeBrightnessM: the pack's smooth(eyeBrightness.y/240, 5, 5) custom uniform — now actually smoothed.
         program.setFloat("eyeBrightnessM", this.eyeBrightnessMSmoothed);
         program.setFloat("yl_UndergroundSurfaceY", this.undergroundSurfaceY); // VL underground gate (fixVlEmptyTexel)
+        // RAW (unsmoothed) eye skylight for the DIRECT-light gate (fixGbuffersShadowVerdict): eyeBrightnessM's 5s
+        // smoothing made the sun-leak dash fade out over seconds after entering the pit instead of never appearing
+        // (user report 2026-08-04 "時間がたつと消えます"). The eye's CURRENT skylight is the right question for
+        // "can this eye legitimately be seeing sunlit ground" — no easing wanted.
+        program.setFloat("yl_EyeSkylightRaw", this.eyeBrightnessSky / 240.0F);
         program.setFloat("eyeBrightnessM2", this.eyeBrightnessM2); // smoothed "eye in FULL skylight" flag (2s/2s)
         program.setFloat("eyeAltitude", (float) this.cameraY);
         // cameraPositionFract: the pack's `cameraPositionBestFract = cameraPositionFract` (common.glsl:878) — the voxel
