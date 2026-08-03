@@ -39,6 +39,9 @@ public class ClientProxy implements IProxy {
         MinecraftForge.EVENT_BUS.register(new YumeliumDebugOverlay());
         MinecraftForge.EVENT_BUS.register(new YumeliumHudOverlay());
         MinecraftForge.EVENT_BUS.register(new DynamicLightsHandler());
+        // Procedural-geometry cache lifecycle (frame counter, idle eviction, world-unload cleanup). The consumers are
+        // LATE mixins into third-party renderers (see YumeliumLateMixins) — nothing here touches other mods' classes.
+        MinecraftForge.EVENT_BUS.register(com.yumelium.yumelium.client.entity.ProceduralGeometryCache.INSTANCE);
 
         ClientRegistry.registerKeyBinding(ZoomHandler.ZOOM_KEY);
         MinecraftForge.EVENT_BUS.register(ZoomHandler.instance());

@@ -84,6 +84,10 @@ public class SodiumGameOptions {
         // Verbose diagnostic logging (pack rosters, probe details, pipeline chatter, id-mapping reports). OFF for
         // normal play: verdict lines (probe GO/NO-GO) and all warnings/errors are logged regardless.
         public boolean debugLogging = false;
+        // Capture-and-replay caching for expensive procedural mod renderers (Betweenlands Sludge Menace hull):
+        // the shadow pass's build is reused by the camera pass in the same frame, and distant hulls rebuild at a
+        // reduced rate. Near entities keep per-frame animation, so ON has no visible cost.
+        public boolean modRendererCache = true;
         // Connected textures. The engine is ours; the tiles come from the Yumelium companion resource pack, so this is a
         // plain on/off — the old Legacy/New choice only existed to pick between two tile sets embedded in the jar, and
         // the jar no longer embeds any. With it on but no pack installed, glass just renders normally.

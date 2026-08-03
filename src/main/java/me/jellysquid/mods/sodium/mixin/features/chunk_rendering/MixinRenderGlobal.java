@@ -71,6 +71,10 @@ public abstract class MixinRenderGlobal {
     @Unique
     private SodiumWorldRenderer sodium$renderer;
 
+    /** TEMP DIAG rate limiter — see the boss-gate probe in {@link #sodium$renderEntities}. */
+    @Unique
+    private static int yumelium$diagBossCounter;
+
     @Inject(method = "<init>", at = @At("RETURN"))
     private void sodium$init(Minecraft minecraft, CallbackInfo ci) {
         this.sodium$renderer = SodiumWorldRenderer.create();
@@ -154,24 +158,48 @@ public abstract class MixinRenderGlobal {
         // Loop-invariant work hoisted out of a body that runs once per LOADED entity per render pass (2300 entities
         // x 2 passes on the benchmark). Vanilla recomputes both inside the loop; neither depends on `entity`.
         final SodiumWorldRenderer yumelium$renderer = SodiumWorldRenderer.getInstance();
+        // (TEMP DIAG counter — see the boss-gate probe in the loop.)
+        // declared below as a mixin field
         final boolean yumelium$isSleeping = renderViewEntity instanceof EntityLivingBase
                 && ((EntityLivingBase) renderViewEntity).isPlayerSleeping();
         final boolean yumelium$thirdPerson = this.mc.gameSettings.thirdPersonView != 0;
         try {
         for (Entity entity : loadedEntityList) {
+            // TEMP DIAG (2026-08-03, debug-gated + rate-limited): which camera-loop gate rejects the Sludge Menace
+            // with shaders on? The hull probe proved the SHADOW pass reaches its renderer every frame while the
+            // camera pass never does.
+            final boolean yumelium$diagBoss = me.jellysquid.mods.sodium.client.SodiumClientMod.debugLogs()
+                    && entity.getClass().getName().contains("SludgeMenace")
+                    && ((yumelium$diagBossCounter++ & 0x1F) == 0);
+
             // Skip entities that shouldn't render in this pass
             if (!entity.shouldRenderInPass(pass)) {
+                if (yumelium$diagBoss) {
+                    me.jellysquid.mods.sodium.client.SodiumClientMod.logger().info(
+                            "[bossGate DIAG] REJECTED by shouldRenderInPass(pass=" + pass + ")");
+                }
                 continue;
             }
 
             // Do regular vanilla checks for visibility
             if (!this.renderManager.shouldRender(entity, camera, renderViewX, renderViewY, renderViewZ) && !entity.isRidingOrBeingRiddenBy(player)) {
+                if (yumelium$diagBoss) {
+                    me.jellysquid.mods.sodium.client.SodiumClientMod.logger().info(
+                            "[bossGate DIAG] REJECTED by renderManager.shouldRender (box=" + entity.getRenderBoundingBox() + ")");
+                }
                 continue;
             }
 
             // Check if any corners of the bounding box are in a visible subchunk
             if (!yumelium$renderer.isEntityVisible(entity)) {
+                if (yumelium$diagBoss) {
+                    me.jellysquid.mods.sodium.client.SodiumClientMod.logger().info(
+                            "[bossGate DIAG] REJECTED by isEntityVisible (box=" + entity.getRenderBoundingBox() + ")");
+                }
                 continue;
+            }
+            if (yumelium$diagBoss) {
+                me.jellysquid.mods.sodium.client.SodiumClientMod.logger().info("[bossGate DIAG] PASSED all gates -> renderEntityStatic");
             }
 
             if ((entity != renderViewEntity || yumelium$thirdPerson || yumelium$isSleeping)
@@ -191,7 +219,12 @@ public abstract class MixinRenderGlobal {
         } finally {
             IrisPipeline.instance().addCameraEntityCpu(yumelium$cpuStart);
             IrisPipeline.instance().profileSwitch("gb_other"); // back to the enclosing gbuffers phase
-            IrisPipeline.instance().endEntities();
+            // endEntities() deliberately DOES NOT happen here (2026-08-03): vanilla's renderEntities continues after
+            // this injection with its MULTIPASS block — Render.isMultipass() renderers get a second render call
+            // there, and the Betweenlands' multipart bosses (Sludge Menace) draw their ENTIRE visible body in it.
+            // Closing the entity pass here left that block running with NO program bound (probe-measured prog=0):
+            // the boss rendered fixed-function into the pipeline and vanished from the shaded image. The pass now
+            // ends at the head of sodium$renderTileEntities, which vanilla reaches right after the multipass block.
         }
     }
 
@@ -208,6 +241,11 @@ public abstract class MixinRenderGlobal {
             cancellable = true
     )
     private void sodium$renderTileEntities(Entity renderViewEntity, ICamera camera, float partialTicks, CallbackInfo ci) {
+        // Close the ENTITY pass here, not at the end of sodium$renderEntities: vanilla's MULTIPASS block (the second
+        // render of Render.isMultipass() renderers — the Betweenlands' multipart bosses draw their whole body there)
+        // runs between the two injection points and must stay inside the gbuffers_entities bracket, or it renders
+        // with no program bound and the boss disappears from the shaded image (2026-08-03). No-ops when already ended.
+        IrisPipeline.instance().endEntities();
         // Route TESRs through the pack's gbuffers_block (no-op when shaders are off). Standard item lighting is already
         // set up (this inject is right after the 2nd enableStandardItemLighting); try/finally so the program can't leak.
         IrisPipeline.instance().beginBlockEntities();

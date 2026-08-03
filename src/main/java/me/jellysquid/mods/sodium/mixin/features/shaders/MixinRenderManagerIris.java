@@ -20,5 +20,15 @@ public class MixinRenderManagerIris {
     @Inject(method = "renderEntityStatic(Lnet/minecraft/entity/Entity;FZ)V", at = @At("HEAD"))
     private void yumelium$perEntityUniforms(Entity entityIn, float partialTicks, boolean debug, CallbackInfo ci) {
         IrisPipeline.instance().onEntityRender(entityIn);
+        // Current-entity tracking for the procedural geometry cache: renderEntityStatic is the funnel BOTH passes use
+        // (the camera loop and the shadow caster loop), so a renderer deep inside doRender — the Betweenlands hull
+        // builder reached through a LATE mixin that must not capture the mod's own types — can ask which entity it is
+        // rendering without any BL compile dependency. Push/pop (not a single field) because passengers recurse.
+        com.yumelium.yumelium.client.entity.ProceduralGeometryCache.pushCurrentEntity(entityIn);
+    }
+
+    @Inject(method = "renderEntityStatic(Lnet/minecraft/entity/Entity;FZ)V", at = @At("RETURN"), require = 1)
+    private void yumelium$perEntityUniformsEnd(Entity entityIn, float partialTicks, boolean debug, CallbackInfo ci) {
+        com.yumelium.yumelium.client.entity.ProceduralGeometryCache.popCurrentEntity();
     }
 }
