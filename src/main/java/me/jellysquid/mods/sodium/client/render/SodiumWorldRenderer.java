@@ -511,8 +511,10 @@ public class SodiumWorldRenderer {
      * guessed repairs made things worse without ever identifying the state.
      *
      * <p>OFF in normal play: the entry capture is a batch of {@code glGet}s on every shadow pass of every frame, which
-     * is a driver sync point for a number nobody reads. Turn it back on to resume the hunt for whatever state a
-     * failing renderer leaves behind — the one thing {@link #iris$isShadowUnsafeTesr} avoids rather than fixes.</p>
+     * is a driver sync point for a number nobody reads. The hunt it was built for is OVER — the leaked state was an
+     * open GL_COMPILE display list (see {@link #iris$closeOpenDisplayList}), which this diagnostic could never have
+     * seen anyway: with a list open, its own capture-at-exit glGets execute but the differences they would report
+     * were in commands that were silently recorded, not in queryable state. Kept as a general-purpose instrument.</p>
      */
     private static final boolean IRIS_DIAG_CASTER_STATE = false;
     private boolean iris$stateDiffLogged;
@@ -578,9 +580,14 @@ public class SodiumWorldRenderer {
      * {@code IllegalStateException: Already building!} out of {@code TexturedQuad.draw} (it re-enters
      * {@code BufferBuilder.begin()}), and from one second after that single throw the client logs
      * {@code GL_INVALID_OPERATION} at "Post render" EVERY frame: the screen flashes black, memory climbs, and it
-     * eventually dies. Catching the throw does not help — {@link #iris$unwindCaster} restores the matrix stacks,
-     * blend and polygon offset, yet the errors continue, so the renderer leaves behind some other state (client
-     * vertex-array state, a bound object) that we never identified. Reacting is therefore too late by construction.</p>
+     * eventually dies. IDENTIFIED 2026-08-03 (camera-pass crash of the same renderer): the throw happens inside
+     * vanilla {@code ModelRenderer.compileDisplayList}, between {@code glNewList(GL_COMPILE)} and {@code glEndList}
+     * — the open COMPILE-mode list then RECORDS every subsequent GL command instead of executing it (black screen,
+     * unbounded list growth), and the un-{@code compiled} model retries {@code glNewList} every frame (the error
+     * storm). {@link #iris$closeOpenDisplayList} now repairs exactly that, and the collision itself is a FastTESR
+     * slow-adapter artifact (see the batching bracket in {@link #renderTileEntities}). The pre-screen stays anyway:
+     * the shadow pass's explicit-offset dispatcher calls are unbatched, so these renderers would still throw once
+     * per class here — an expensive CrashReport per throw for shadows that never draw.</p>
      *
      * <p>Scoped to the Betweenlands because that is the mod where the failure is measured — six of its TESRs fail in
      * here — and its block entities are decorative enough that losing their shadows is a fair price for a client that
@@ -635,6 +642,9 @@ public class SodiumWorldRenderer {
      * bias {@code renderShadowPass} enabled for the whole pass.</p>
      */
     private void iris$unwindCaster() {
+        // FIRST, before any other repair: close a display list a throwing renderer left open in GL_COMPILE mode
+        // (see iris$closeOpenDisplayList — with a list open, every repair below would be RECORDED, not executed).
+        iris$closeOpenDisplayList("shadow caster");
         try {
             iris$popMatrixStackTo(GL11.GL_PROJECTION, GL11.GL_PROJECTION_STACK_DEPTH, this.iris$passProjectionDepth);
             iris$popMatrixStackTo(GL11.GL_MODELVIEW, GL11.GL_MODELVIEW_STACK_DEPTH, this.iris$passModelViewDepth);
@@ -1119,7 +1129,33 @@ public class SodiumWorldRenderer {
 
         int pass = MinecraftForgeClient.getRenderPass();
 
-        forEachVisibleBlockEntity(blockEntity -> renderTileEntity(blockEntity, pass, partialTicks));
+        // Forge's TESR batching bracket, restored (2026-08-03). Forge-patched RenderGlobal.renderEntities wraps its
+        // tile-entity loop in preDrawBatch()/drawBatch(pass); our MixinRenderGlobal cancelled that loop and this
+        // replacement had dropped the bracket, so drawingBatch stayed false and every FastTESR fell into its SLOW
+        // adapter — which begins the SHARED Tessellator and then calls renderTileEntityFast against it.
+        //
+        // That is not just a performance difference, it is a crash: a FastTESR whose model renders through vanilla
+        // ModelRenderer display lists (Betweenlands RenderSpikeTrap -> ModelDungeonSpoopLayer) hits
+        // compileDisplayList on the model's FIRST-ever draw, and compileDisplayList builds its geometry through the
+        // same shared Tessellator the slow adapter just opened -> "Already building!" -> and because the throw
+        // happens between glNewList(GL_COMPILE) and glEndList, a display list is left OPEN, silently swallowing
+        // every subsequent GL command (recorded, not executed): black screen, unbounded memory growth. With the
+        // bracket, drawingBatch is true, the dispatcher routes hasFastRenderer() TEs into its own separate
+        // batchBuffer, and first-time display-list compiles get the free Tessellator — stock Forge behaviour, which
+        // is what mods like the Betweenlands were written against.
+        TileEntityRendererDispatcher.instance.preDrawBatch();
+        try {
+            forEachVisibleBlockEntity(blockEntity -> renderTileEntity(blockEntity, pass, partialTicks));
+        } finally {
+            // Re-assert the block program before the batched draw: the last TESR of the loop may have left the
+            // beacon's emissive program + its alphaTest override bound (null TE = base program, no beacon). Batched
+            // quads therefore draw with blockEntityId = 0 — acceptable: the TESRs the pack's blockEntityIPBR keys on
+            // (chests, signs, banners, shulkers) are all SLOW renderers and keep their per-TE id.
+            com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().onBlockEntityRender(null);
+            // In a finally so a throwing TESR can never leave dispatcher.drawingBatch stuck at true — the shadow
+            // pass's dispatcher.render calls would otherwise route FastTESRs into a batch buffer nobody draws.
+            TileEntityRendererDispatcher.instance.drawBatch(pass);
+        }
     }
 
     private void renderTileEntity(TileEntity tileEntity, int pass, float partialTicks) {
@@ -1137,11 +1173,43 @@ public class SodiumWorldRenderer {
         try {
             TileEntityRendererDispatcher.instance.render(tileEntity, partialTicks, -1);
         } catch (RuntimeException e) {
+            // A renderer that threw between glNewList(GL_COMPILE) and glEndList leaves a display list OPEN, and an
+            // open COMPILE-mode list RECORDS every subsequent GL command instead of executing it — including the
+            // main menu after FermiumASM's soft crash-to-menu. Close it before letting the crash propagate.
+            iris$closeOpenDisplayList("camera TESR " + tileEntity.getClass().getName());
             if (tileEntity.isInvalid()) {
                 SodiumClientMod.logger().error("Suppressing crash from invalid tile entity", e);
             } else {
                 throw e;
             }
+        }
+    }
+
+    /**
+     * Close a display list left open in {@code GL_COMPILE} mode by a renderer that threw mid-compile.
+     *
+     * <p>This was the unidentified GL corruption of the 2026-08-03 ENTITY_SHADOW hunt. Vanilla
+     * {@code ModelRenderer.compileDisplayList} runs {@code glNewList(GL_COMPILE)} → Tessellator geometry →
+     * {@code glEndList}; when the geometry step throws (the shared Tessellator was already building — the
+     * Betweenlands FastTESR slow-adapter collision), {@code glEndList} never runs. In GL_COMPILE mode every
+     * subsequent command is RECORDED into the open list instead of executed: the screen goes black (nothing draws),
+     * memory climbs without bound (the list grows), and because {@code compiled} stays false the renderer retries
+     * {@code glNewList} every frame — the GL_INVALID_OPERATION storm. It also explains why the old unwind repairs
+     * "did nothing": the repair commands themselves were being recorded into the list, not executed. glGet queries
+     * execute immediately even while a list is open, so the probe below is reliable — and this must run BEFORE any
+     * other GL repair, or the repairs are swallowed too.</p>
+     */
+    private static void iris$closeOpenDisplayList(String where) {
+        try {
+            int list = GL11.glGetInteger(GL11.GL_LIST_INDEX);
+            if (list != 0) {
+                GL11.glEndList();
+                SodiumClientMod.logger().warn("[Yumelium] closed display list " + list
+                        + " left open in GL_COMPILE mode by a throwing renderer (" + where
+                        + ") — GL commands were being recorded instead of executed");
+            }
+        } catch (Throwable ignored) {
+            // the repair must never become its own crash
         }
     }
 
