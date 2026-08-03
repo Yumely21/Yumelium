@@ -124,8 +124,8 @@ public class CompactChunkVertex implements ChunkVertexType {
 
         MemoryUtil.memPutInt(ptr + 8, vertex.color);
 
-        MemoryUtil.memPutShort(ptr + 12, encodeTexture(vertex.u));
-        MemoryUtil.memPutShort(ptr + 14, encodeTexture(vertex.v));
+        MemoryUtil.memPutShort(ptr + 12, encodeTexture(vertex.u, vertex.midU));
+        MemoryUtil.memPutShort(ptr + 14, encodeTexture(vertex.v, vertex.midV));
 
         MemoryUtil.memPutInt(ptr + 16, vertex.light);
     }
@@ -153,5 +153,27 @@ public class CompactChunkVertex implements ChunkVertexType {
 
     private static short encodeTexture(float value) {
         return (short) (Math.round(value * TEXTURE_MAX_VALUE) & 0xFFFF);
+    }
+
+    /**
+     * Quantize a texture coordinate WITHOUT ever moving it outward past the authored extent: coordinates below the
+     * quad's UV centre round UP (inward), coordinates above it round DOWN (inward).
+     *
+     * <p>DELIBERATE upstream divergence (2026-08-03, the mud-tile seam dots — probe-measured): the model baker insets
+     * quad UVs a fraction of a texel from the sprite border precisely so edge fragments never sample the neighboring
+     * atlas sprite (measured: sprite border 21760/32768, baked UV 21759.744). Round-to-nearest DESTROYS that inset —
+     * 21759.744 rounds to 21760, the exact border — and along the quad's edge pixels GL_NEAREST then flips into the
+     * texel one atlas column over. Where that foreign texel is transparent, the cutout discard punches a HOLE and the
+     * background shows through: the white view-dependent dots along Betweenlands mud-tile seams (their sprites'
+     * atlas neighbours happen to make it visible; the raw-float VANILLA_LIKE format keeps the inset, which is why the
+     * A/B was clean). Rounding toward the centre keeps the quantized UV inside the authored bounds at the cost of at
+     * most one unit (1/16 texel on the 2048 atlas) of inward shift — invisible. The centre itself and the
+     * COMPACT_NORMAL mid-tex attribute keep plain round-to-nearest (encodeTexture above): mid only anchors foliage
+     * waving and sprite-bound reconstruction, where nearest is correct.</p>
+     */
+    private static short encodeTexture(float value, float mid) {
+        float scaled = value * TEXTURE_MAX_VALUE;
+        int quantized = value <= mid ? (int) Math.ceil(scaled) : (int) Math.floor(scaled);
+        return (short) (quantized & 0xFFFF);
     }
 }

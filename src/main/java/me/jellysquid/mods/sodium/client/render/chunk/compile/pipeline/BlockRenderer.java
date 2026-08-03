@@ -480,6 +480,27 @@ public class BlockRenderer {
             }
         }
 
+        if (DIAG_SEAM_PROBE && DIAG_SEAM_COUNT.get() < 600) {
+            String stateName = String.valueOf(ctx.state());
+            if (stateName.contains("mud_tiles")) {
+                DIAG_SEAM_COUNT.incrementAndGet();
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < 4; i++) {
+                    float vx = ctx.origin().x() + quad.getX(i) + (float) offset.x;
+                    float vy = ctx.origin().y() + quad.getY(i) + (float) offset.y;
+                    float vz = ctx.origin().z() + quad.getZ(i) + (float) offset.z;
+                    sb.append(String.format(" v%d=(%.9f,%.9f,%.9f)q(%d,%d,%d)uv(%.7f,%.7f)", i, vx, vy, vz,
+                            (int) ((8.0f + vx) * 2048.0f + 0.5f),
+                            (int) ((8.0f + vy) * 2048.0f + 0.5f),
+                            (int) ((8.0f + vz) * 2048.0f + 0.5f),
+                            quad.getTexU(i), quad.getTexV(i)));
+                }
+                SodiumClientMod.logger().info("[seam DIAG] pos=" + ctx.pos() + " face=" + normalFace
+                        + " sprite=" + (quad.getSprite() == null ? "null" : quad.getSprite().getIconName())
+                        + " state=" + stateName + sb);
+            }
+        }
+
         // Complementary block id (mc_Entity.x) for foliage waving + light-source voxelization; same on all 4 vertices.
         int bid = blockId(ctx);
 
@@ -559,6 +580,17 @@ public class BlockRenderer {
         int pw = Math.round(w * 127f) & 0xFF;
         return px | (py << 8) | (pz << 16) | (pw << 24);
     }
+
+    /**
+     * DIAGNOSTIC (2026-08-03, RESOLVED — keep as lever): dumps every quad of the Betweenlands mud_tiles family — raw
+     * float vertex coordinates at 9 decimals plus the exact u16 values the compact encoder would produce, and the raw
+     * UVs. This probe settled the seam-dot hunt: positions were bit-exact integers (geometry innocent), but the UVs
+     * showed the baker's sub-unit anti-bleed inset (21759.744 vs sprite border 21760) that round-to-nearest
+     * quantization erased — see CompactChunkVertex.encodeTexture(float, float) for the fix.
+     */
+    private static final boolean DIAG_SEAM_PROBE = false;
+    private static final java.util.concurrent.atomic.AtomicInteger DIAG_SEAM_COUNT =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     /** One-shot report of blocks whose quad UVs give an impossible sprite radius (see the use site). */
     private static final boolean DIAG_MIDTEX = false;
