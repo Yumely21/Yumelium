@@ -47,6 +47,7 @@ public final class TerrainShaderTransformer {
             "uniform float iris_shadowPass;\n" +
             "uniform float iris_shadowMapBias;\n" +
             "out float iris_MipBias;\n" +
+            "out float iris_AlphaCutoff;\n" + // per-material alpha cutoff {0.0, 0.1, 0.5, 1.0} — see the fragment discard rewrite
             "out float iris_Desaturate;\n" +
             "out vec3 iris_viewNormal;\n" +
             "out vec2 iris_dbgUV;\n" +
@@ -83,6 +84,7 @@ public final class TerrainShaderTransformer {
             "    iris_MultiTexCoord1 = vec4((vec2(_vert_tex_light_coord) + 8.0) / 256.0, 0.0, 1.0);\n" +
             "    iris_MVP = u_ProjectionMatrix * u_ModelViewMatrix;\n" +
             "    iris_MipBias = _material_mip_bias(_material_params);\n" +
+            "    iris_AlphaCutoff = _material_alpha_cutoff(_material_params);\n" +
             "    iris_Desaturate = _material_desaturate(_material_params) ? 1.0 : 0.0;\n" +
             "    iris_viewNormal = mat3(u_ModelViewMatrix) * _vert_normal;\n" +
             // Synthesize the OptiFine attributes the pack reads. mc_Entity.x lets Complementary identify grass/leaves;
@@ -491,6 +493,27 @@ public final class TerrainShaderTransformer {
         // is −4 for cutout (≈ forces level 0, no bleed) and 0 for solid/mipped (leaves keep their mipmaps), so it is correct
         // per-material. Only plain texture2D(...) atlas reads are biased; texture2DLod (explicit LOD) reads are left alone.
         body = body.replaceAll("texture2D\\(\\s*(tex|u_BlockTex)\\s*,\\s*([^,()]*)\\)", "texture2D($1, $2, iris_MipBias)");
+        // Per-material alpha cutoff on the pack's albedo discard (TERRAIN only; water is the translucent layer, whose
+        // materials carry cutoff 0.0 — its transparent texels must BLEND, not discard). Complementary's own threshold is
+        // 0.00001, tuned for textures whose transparent texels are EXACTLY alpha 0 — mods ship textures where "transparent"
+        // is alpha 1/255 (≈0.004, e.g. Betweenlands pale grass): those fragments survived, wrote DEPTH over the whole
+        // cross-quad while drawing nearly-invisible colour, and depth-tested effects drawn later (BL's RenderWorldLast gas
+        // clouds) were erased in quad-shaped holes. Vanilla, OptiFine and our own shaders-off path all kill such texels
+        // with the per-layer alpha test (0.1 cutout / 0.5 mipped) — iris_AlphaCutoff is exactly that value per material
+        // (chunk_material.glsl), so ON now matches OFF. Anchored on the pack's marker comment; a pack update that drops
+        // the anchor loses only this hardening, and the miss is logged loudly below.
+        if ("terrain".equals(what)) {
+            String anchor = "if (color.a <= 0.00001) discard; // 6WIR4HT23";
+            String replaced = body.replace(anchor,
+                    "if (color.a <= max(0.00001, iris_AlphaCutoff)) discard; // 6WIR4HT23 [+ yumelium per-material cutoff]");
+            if (replaced.equals(body)) {
+                me.jellysquid.mods.sodium.client.SodiumClientMod.logger().warn(
+                        "[Yumelium] terrain alpha-cutoff anchor MISSING (pack updated?) — low-alpha 'transparent' texels"
+                        + " of modded cutout blocks will write depth and punch holes in late-drawn effects");
+            } else {
+                body = replaced;
+            }
+        }
         String tail = "";
         if (DEBUG_LIGHTING_VIZ) {
             body = body.replaceAll("\\bvoid\\s+main\\s*\\(", "void iris_pack_main(");
@@ -529,6 +552,7 @@ public final class TerrainShaderTransformer {
                 + "// ---- transformed pack gbuffers_terrain (fragment, real-pack legacy path) ----\n"
                 + "in vec2 iris_dbgUV;\n"
                 + "in float iris_MipBias;\n" // per-material atlas mip bias (see the texture2D bias above)
+                + "in float iris_AlphaCutoff;\n" // per-material alpha cutoff (see the terrain discard rewrite above)
                 + body + tail;
         if (DIAG_DUMP_TRANSFORMED) {
             dump("iris_" + what + "_dump.fsh", out);
