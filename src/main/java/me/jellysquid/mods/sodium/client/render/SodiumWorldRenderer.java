@@ -1323,9 +1323,15 @@ public class SodiumWorldRenderer {
 
     /**
      * Schedules a chunk rebuild for the render belonging to the given chunk section position.
+     *
+     * <p>Null-tolerant on purpose: callers driven by CLIENT TICKS rather than the render loop — the dynamic light
+     * manager clearing its baked light — can fire on the tick after a world unload, when the section manager is
+     * already destroyed. There is nothing left to rebuild then; crashing the unload was the bug (2026-08-03).</p>
      */
     public void scheduleRebuildForChunk(int x, int y, int z, boolean important) {
-        this.renderSectionManager.scheduleRebuild(x, y, z, important);
+        if (this.renderSectionManager != null) {
+            this.renderSectionManager.scheduleRebuild(x, y, z, important);
+        }
     }
 
     public boolean isSectionReady(int x, int y, int z) {

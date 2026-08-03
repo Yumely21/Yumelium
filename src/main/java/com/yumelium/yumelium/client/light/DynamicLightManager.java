@@ -78,7 +78,14 @@ public final class DynamicLightManager {
             return;
         }
 
-        if (mode == SodiumGameOptions.DynamicLightsMode.OFF || mc.world == null || mc.player == null) {
+        if (mc.world == null) {
+            // World gone (quit/dimension change): just drop the map — there is nothing left to re-mesh, and the
+            // renderer's section manager may already be destroyed (scheduling here NPE'd the world unload).
+            this.lightmap = Long2IntMaps.EMPTY_MAP;
+            return;
+        }
+
+        if (mode == SodiumGameOptions.DynamicLightsMode.OFF || mc.player == null) {
             if (!this.lightmap.isEmpty()) {
                 Long2IntMap empty = Long2IntMaps.EMPTY_MAP;
                 this.scheduleChangedSections(this.lightmap, empty);
