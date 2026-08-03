@@ -500,16 +500,16 @@ public final class RenderTargets {
                 setLinearFilter(this.colortexB[i]);
             }
         }
-        this.depthTex = newDepthTexture(w, h);
+        this.depthTex = newSceneDepthTexture(w, h);
         // Scratch copy of colortex0 for the water SSR (same internal format so glCopyImageSubData is legal). LINEAR filter
         // so the SSR's sub-pixel reflected-coord reads interpolate smoothly instead of showing blocky nearest texels.
         this.waterReflectTex = newColorTexture(w, h, GL30C.GL_R11F_G11F_B10F);
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, this.waterReflectTex);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
-        // Opaque-depth copy for the water's depthtex1 reads (SSR/refraction/fog). Same DEPTH_COMPONENT24 format as depthTex
-        // so glCopyImageSubData is legal; NEAREST (from newDepthTexture) so depth isn't interpolated across discontinuities.
-        this.waterDepthTex = newDepthTexture(w, h);
+        // Opaque-depth copy for the water's depthtex1 reads (SSR/refraction/fog). Same DEPTH24_STENCIL8 format as depthTex
+        // so glCopyImageSubData is legal; NEAREST (from newTexture) so depth isn't interpolated across discontinuities.
+        this.waterDepthTex = newSceneDepthTexture(w, h);
         // waterRefColor snapshot (gaux2 for the water). Same RGBA8 as colortex5; LINEAR so the SSR's fractional reads interpolate.
         this.waterRefTex = newColorTexture(w, h, GL11C.GL_RGBA8);
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, this.waterRefTex);
@@ -529,7 +529,10 @@ public final class RenderTargets {
 
         this.fbo = GL30C.glGenFramebuffers();
         GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, this.fbo);
-        GL30C.glFramebufferTexture2D(GL30C.GL_FRAMEBUFFER, GL30C.GL_DEPTH_ATTACHMENT,
+        // DEPTH_STENCIL attachment, not DEPTH: depthTex is packed depth24+stencil8 (see newSceneDepthTexture) and the
+        // stencil half must actually be attached or stencil-based TESRs stay broken. ALL world-fbo depth attach/detach
+        // sites must use this same attachment point — mixing them leaves a stale stencil attachment behind.
+        GL30C.glFramebufferTexture2D(GL30C.GL_FRAMEBUFFER, GL30C.GL_DEPTH_STENCIL_ATTACHMENT,
                 GL11.GL_TEXTURE_2D, this.depthTex, 0);
         GL30C.glFramebufferTexture2D(GL30C.GL_FRAMEBUFFER, GL30C.GL_COLOR_ATTACHMENT0,
                 GL11.GL_TEXTURE_2D, this.colortexA[0], 0);
@@ -560,6 +563,31 @@ public final class RenderTargets {
 
     private static int newDepthTexture(int w, int h) {
         return newTexture(w, h, GL14C.GL_DEPTH_COMPONENT24, GL11.GL_DEPTH_COMPONENT, GL11.GL_FLOAT);
+    }
+
+    /**
+     * The SCENE depth texture: packed depth24 + stencil8 instead of plain depth24 — same 24-bit depth precision, plus
+     * a real stencil buffer on the world FBO.
+     *
+     * <p>Why the scene needs stencil at all (2026-08-03): with shaders on, block-entity/entity renderers draw into
+     * OUR fbo, and stencil-based renderers — the Betweenlands' mirror ({@code RenderBeamOrigin}) and hole illusions
+     * ({@code RenderWallHole}, {@code RenderCCGroundSpawner}) — validate stencil availability against MC's OWN
+     * {@code Framebuffer} object ({@code Stencil.reserve} → {@code MinecraftForgeClient.reserveStencilBit} +
+     * {@code mcFbo.enableStencil()}), never against the framebuffer actually bound. On a stencil-less FBO the GL spec
+     * makes the stencil test ALWAYS PASS and stencil writes no-ops, so the mask those renderers build simply doesn't
+     * exist: the mud-tower mirror rendered as a giant unmasked translucent triangle across the whole screen. Giving
+     * the world FBO a real stencil buffer makes their glStencilFunc/Op act on actual bits again — vanilla behaviour.
+     * Nothing in the pack or the pipeline touches stencil, so the bits belong entirely to such mods.</p>
+     *
+     * <p>Depth reads are unaffected: sampling a DEPTH24_STENCIL8 texture returns the depth component (default
+     * {@code DEPTH_STENCIL_TEXTURE_MODE}), and {@code glGetTexImage}/{@code glGetTextureSubImage} with
+     * {@code GL_DEPTH_COMPONENT} stay legal. {@code waterDepthTex} must keep the IDENTICAL internal format —
+     * {@code copyDepthForWater} uses {@code glCopyImageSubData}, which requires format compatibility. The SHADOW
+     * depth textures deliberately stay plain DEPTH_COMPONENT24 (nothing stencil-tests the light's view, and their
+     * snapshot blit only needs the two of THEM to match).</p>
+     */
+    private static int newSceneDepthTexture(int w, int h) {
+        return newTexture(w, h, GL30C.GL_DEPTH24_STENCIL8, GL30C.GL_DEPTH_STENCIL, GL30C.GL_UNSIGNED_INT_24_8);
     }
 
     /** Sets a colortex to LINEAR min/mag so fractional-coord reads (e.g. TAA's textureCatmullRom on colortex2) interpolate. */
@@ -1304,7 +1332,7 @@ public final class RenderTargets {
      */
     public void beginWorldPass(float clearR, float clearG, float clearB) {
         GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, this.fbo);
-        GL30C.glFramebufferTexture2D(GL30C.GL_FRAMEBUFFER, GL30C.GL_DEPTH_ATTACHMENT,
+        GL30C.glFramebufferTexture2D(GL30C.GL_FRAMEBUFFER, GL30C.GL_DEPTH_STENCIL_ATTACHMENT,
                 GL11.GL_TEXTURE_2D, this.depthTex, 0);
         GlStateManager.viewport(0, 0, this.width, this.height);
 
@@ -1328,7 +1356,9 @@ public final class RenderTargets {
         this.colorAttachHigh = 1;
         GL20C.glDrawBuffers(new int[]{GL30C.GL_COLOR_ATTACHMENT0});
         GlStateManager.clearColor(clearR, clearG, clearB, 1.0F);
-        GlStateManager.clear(GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT);
+        // Stencil cleared with depth: the scene depth is packed depth24+stencil8 now (stencil-based TESRs — see
+        // newSceneDepthTexture), and last frame's mirror/hole masks must not leak into this frame's tests.
+        GlStateManager.clear(GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT | GL11.GL_STENCIL_BUFFER_BIT);
     }
 
     /**
@@ -1484,7 +1514,7 @@ public final class RenderTargets {
      * back into {@code depthTex} — the very buffer the composite samples as {@code depthtex0} — or the composite reads the
      * background depth behind the hand and blends sky/clouds/fog through it (a see-through hand). */
     public void attachSceneDepth() {
-        GL30C.glFramebufferTexture2D(GL30C.GL_FRAMEBUFFER, GL30C.GL_DEPTH_ATTACHMENT, GL11.GL_TEXTURE_2D, this.depthTex, 0);
+        GL30C.glFramebufferTexture2D(GL30C.GL_FRAMEBUFFER, GL30C.GL_DEPTH_STENCIL_ATTACHMENT, GL11.GL_TEXTURE_2D, this.depthTex, 0);
     }
 
     /** Detaches the extra terrain targets and returns to colortex0-only drawing (sky/entities/particles). */
@@ -1596,7 +1626,7 @@ public final class RenderTargets {
      * it, and it's being sampled as depthtex0). {@code gl_FragData[i]} → {@code colortex[indices[i]]}. */
     public void bindCompositeTargets(int[] indices) {
         GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, this.fbo);
-        GL30C.glFramebufferTexture2D(GL30C.GL_FRAMEBUFFER, GL30C.GL_DEPTH_ATTACHMENT, GL11.GL_TEXTURE_2D, 0, 0);
+        GL30C.glFramebufferTexture2D(GL30C.GL_FRAMEBUFFER, GL30C.GL_DEPTH_STENCIL_ATTACHMENT, GL11.GL_TEXTURE_2D, 0, 0);
         if (indices.length == 0) {
             // SIDE-EFFECT-ONLY pass (prepare: its work is image load/store in the vertex; the fragment discards).
             // Keep ONE colour attachment so the FBO stays complete, but select no draw buffers at all — nothing may
@@ -1637,7 +1667,7 @@ public final class RenderTargets {
         // Leave ONLY colortexN on attachment 0 (detach depth + the extra colour attachments a composite pass left behind),
         // so the read framebuffer is single-attachment + complete for the blit — a stray/mismatched attachment makes
         // glBlitFramebuffer raise GL_INVALID_OPERATION (1282) and silently do nothing (→ white screen).
-        GL30C.glFramebufferTexture2D(GL30C.GL_FRAMEBUFFER, GL30C.GL_DEPTH_ATTACHMENT, GL11.GL_TEXTURE_2D, 0, 0);
+        GL30C.glFramebufferTexture2D(GL30C.GL_FRAMEBUFFER, GL30C.GL_DEPTH_STENCIL_ATTACHMENT, GL11.GL_TEXTURE_2D, 0, 0);
         for (int i = 1; i < this.colorAttachHigh; i++) {
             GL30C.glFramebufferTexture2D(GL30C.GL_FRAMEBUFFER, GL30C.GL_COLOR_ATTACHMENT0 + i, GL11.GL_TEXTURE_2D, 0, 0);
         }
