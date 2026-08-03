@@ -3731,9 +3731,54 @@ public final class IrisPipeline {
      * block.properties id of its block state, resolved through the SAME mapper terrain meshing uses — this is what
      * routes chests/signs/banners/conduits through the pack's blockEntityIPBR material dispatch instead of id 0.
      */
+    /**
+     * Whether the block-entity pass is currently dropped to FIXED FUNCTION for a stencil-mirror TESR — see
+     * {@link #isStencilMirrorTesr}. Cleared by the next ordinary TESR's re-bind, or by {@link #endBlockEntities}.
+     */
+    private boolean stencilTesrFixedFn;
+
+    /**
+     * TESRs that must render with NO shader program bound (true fixed function, program 0).
+     *
+     * <p>The Betweenlands' mud-tower mirror ({@code RenderBeamOrigin}) builds a stencil mask by drawing its mirror
+     * triangles with {@code disableTexture2D} + {@code colorMask(false×4)}, then draws the reflected world and the
+     * crystal-face tint where the stencil matches. A bound {@code gbuffers_block} ruins the MASK WRITE: the program
+     * ignores the fixed-function texture-off switch and samples the atlas at whatever UVs the triangle carries, and
+     * its cutout {@code discard} kills fragments — a discarded fragment writes NO stencil, so the mask never forms,
+     * the EQUAL test fails everywhere, and the mirror face renders as see-through nothing (2026-08-03, observed the
+     * moment the world FBO gained a real stencil buffer). Program 0 is the compatibility-profile answer (the M0
+     * founding decision guarantees fixed function works): no sampling, no GLSL discard, stencil writes land, and the
+     * reflection draws with fixed-function texturing/lighting exactly as BL intended. The pixels' G-buffer
+     * normal/material keep whatever the geometry behind wrote — acceptable shading for a glowing mirror — and the
+     * draw-buffer list is narrowed to attachment 0 so fixed-function colour cannot smear into the material targets
+     * (RenderTargets.beginFixedFunctionDrawBuffer).</p>
+     *
+     * <p>Matched by class NAME — no Betweenlands class is loaded (Cleanroom classloader invariant).</p>
+     */
+    private static boolean isStencilMirrorTesr(net.minecraft.tileentity.TileEntity te) {
+        return te != null && "thebetweenlands.common.tile.TileEntityBeamOrigin".equals(te.getClass().getName());
+    }
+
     public void onBlockEntityRender(net.minecraft.tileentity.TileEntity te) {
         if (!this.blockActive) {
             return;
+        }
+        if (isStencilMirrorTesr(te)) {
+            if (!this.stencilTesrFixedFn) {
+                this.stencilTesrFixedFn = true;
+                GlslProgram.unuse();
+                this.activeBlockPassProgram = null; // the next ordinary TESR re-binds with full uniform/sampler setup
+                if (this.targets != null) {
+                    this.targets.beginFixedFunctionDrawBuffer();
+                }
+            }
+            return;
+        }
+        if (this.stencilTesrFixedFn) {
+            this.stencilTesrFixedFn = false;
+            if (this.targets != null) {
+                this.targets.restoreActiveDrawBuffers();
+            }
         }
         GlslProgram base = this.blockProgram != null ? this.blockProgram : this.entitiesProgram;
         boolean beacon = te instanceof net.minecraft.tileentity.TileEntityBeacon && this.beaconBeamProgram != null;
@@ -3839,6 +3884,13 @@ public final class IrisPipeline {
 
     public void endBlockEntities() {
         if (this.blockActive) {
+            if (this.stencilTesrFixedFn) {
+                // A stencil-mirror TESR was the LAST one — restore the pass's draw-buffer list before closing.
+                this.stencilTesrFixedFn = false;
+                if (this.targets != null) {
+                    this.targets.restoreActiveDrawBuffers();
+                }
+            }
             if (this.activeBlockPassProgram == this.beaconBeamProgram && this.beaconBeamProgram != null) {
                 restoreAlphaFunc(); // a beacon was the last TESR — drop its alphaTest override
             }

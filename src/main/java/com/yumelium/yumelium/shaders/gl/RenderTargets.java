@@ -1355,6 +1355,7 @@ public final class RenderTargets {
         }
         this.colorAttachHigh = 1;
         GL20C.glDrawBuffers(new int[]{GL30C.GL_COLOR_ATTACHMENT0});
+        this.activeDrawBuffers = new int[]{GL30C.GL_COLOR_ATTACHMENT0};
         GlStateManager.clearColor(clearR, clearG, clearB, 1.0F);
         // Stencil cleared with depth: the scene depth is packed depth24+stencil8 now (stencil-based TESRs — see
         // newSceneDepthTexture), and last frame's mirror/hole masks must not leak into this frame's tests.
@@ -1400,6 +1401,28 @@ public final class RenderTargets {
      * "global" enable — {@code glEnable(GL_BLEND)} just sets every buffer's bit), so the callers' own blend state stays
      * authoritative and {@link #endBlendOverrides} restores the bits we cleared.
      */
+    /** The draw-buffer list most recently issued for the world FBO — what {@link #restoreActiveDrawBuffers} re-issues. */
+    private int[] activeDrawBuffers = {GL30C.GL_COLOR_ATTACHMENT0};
+
+    /**
+     * Restrict rendering to colour attachment 0 for a FIXED-FUNCTION sub-draw inside a live gbuffers pass, without
+     * losing the pass's real draw-buffer list.
+     *
+     * <p>For the Betweenlands' stencil-mirror TESR the pipeline drops to program 0 (fixed function): in a
+     * compatibility profile, fixed-function fragment results are written to EVERY buffer in the draw list, which
+     * would smear plain mirror colours into the pass's normal/material G-buffer targets. Attachment 0 (the pass's
+     * colour output) is the only one such a draw may touch. This deliberately does NOT update
+     * {@link #activeDrawBuffers} — it is a temporary override, undone by {@link #restoreActiveDrawBuffers}.</p>
+     */
+    public void beginFixedFunctionDrawBuffer() {
+        GL20C.glDrawBuffers(new int[]{GL30C.GL_COLOR_ATTACHMENT0});
+    }
+
+    /** Restores the enclosing pass's draw-buffer list after {@link #beginFixedFunctionDrawBuffer}. */
+    public void restoreActiveDrawBuffers() {
+        GL20C.glDrawBuffers(this.activeDrawBuffers);
+    }
+
     public void beginTargets(int[] indices, java.util.Set<Integer> blendOff) {
         int[] draw = new int[indices.length];
         for (int i = 0; i < indices.length; i++) {
@@ -1414,6 +1437,7 @@ public final class RenderTargets {
         }
         this.colorAttachHigh = indices.length;
         GL20C.glDrawBuffers(draw);
+        this.activeDrawBuffers = draw;
 
         // Always resynchronise FIRST: per-slot GL_BLEND bits are global GL state that survives any FBO/target change, so
         // a slot an EARLIER pass disabled would otherwise stay disabled forever once a later pass's off-set no longer
@@ -1528,6 +1552,7 @@ public final class RenderTargets {
         }
         this.colorAttachHigh = 1;
         GL20C.glDrawBuffers(new int[]{GL30C.GL_COLOR_ATTACHMENT0});
+        this.activeDrawBuffers = new int[]{GL30C.GL_COLOR_ATTACHMENT0};
     }
 
     // --- deferred/composite chain ----------------------------------------------------------------------------------
