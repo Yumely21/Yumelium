@@ -31,4 +31,26 @@ public class MixinRenderManagerIris {
     private void yumelium$perEntityUniformsEnd(Entity entityIn, float partialTicks, boolean debug, CallbackInfo ci) {
         com.yumelium.yumelium.client.entity.ProceduralGeometryCache.popCurrentEntity();
     }
+
+    /**
+     * Vanilla's MULTIPASS block — the second render of {@code Render.isMultipass()} renderers, where the Betweenlands'
+     * multipart bosses (Sludge Menace) draw their entire visible body — goes through {@code renderMultipass}, NOT
+     * {@code renderEntityStatic} (RenderGlobal.renderEntities bc 865, javap-verified 2026-08-03). Without these hooks
+     * that draw ran with STALE per-entity uniforms (whatever the last regular entity left in entityId/entityColor) and
+     * the geometry cache could never identify its entity there ({@code currentEntity() == null} → no replay, full
+     * rebuild every camera frame). {@code onEntityRender} also re-binds the entities program if something dropped it —
+     * the block runs inside the entities bracket now that {@code endEntities} moved to the TESR inject.
+     */
+    @Inject(method = "renderMultipass(Lnet/minecraft/entity/Entity;F)V", at = @At("HEAD"), require = 1)
+    private void yumelium$multipassUniforms(Entity entityIn, float partialTicks, CallbackInfo ci) {
+        // DIAG first, so it captures the program state the multipass block NATURALLY has (before our re-bind).
+        com.yumelium.yumelium.client.entity.ProceduralGeometryCache.diagMultipass(entityIn);
+        IrisPipeline.instance().onEntityRender(entityIn);
+        com.yumelium.yumelium.client.entity.ProceduralGeometryCache.pushCurrentEntity(entityIn);
+    }
+
+    @Inject(method = "renderMultipass(Lnet/minecraft/entity/Entity;F)V", at = @At("RETURN"), require = 1)
+    private void yumelium$multipassUniformsEnd(Entity entityIn, float partialTicks, CallbackInfo ci) {
+        com.yumelium.yumelium.client.entity.ProceduralGeometryCache.popCurrentEntity();
+    }
 }

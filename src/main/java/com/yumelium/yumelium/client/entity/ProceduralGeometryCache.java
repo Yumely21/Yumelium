@@ -96,16 +96,72 @@ public final class ProceduralGeometryCache {
         return CURRENT.peek();
     }
 
+    /**
+     * A frame stamp unique per (frame × render pass): the camera pass sees the plain frame counter, the shadow pass a
+     * disjoint negated value. Late mixins redirect third-party "already rendered this frame?" dedup guards through
+     * this ({@code RenderSludgeMenace.doRender}'s {@code renderedFrame} — see MixinRenderSludgeMenace): with the real
+     * counter, our shadow caster pass (which runs BEFORE the camera pass) consumed the one draw the guard allows, so
+     * the boss rendered into the shadow map and then skipped its entire visible body — invisible boss, real shadow
+     * (2026-08-03). Repeated renders within ONE pass still compare equal, so the dedup the guard exists for (many
+     * multipart dummies delegating to one parent) is fully preserved; shaders off never takes the shadow branch, so
+     * behaviour there is exactly vanilla.
+     */
+    public static int passSaltedFrame() {
+        int f = INSTANCE.frame;
+        try {
+            com.yumelium.yumelium.shaders.pipeline.IrisPipeline p =
+                    com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance();
+            if (p.isEnabled() && p.isShadowPass()) {
+                return -f - 1;
+            }
+        } catch (Throwable ignored) {
+        }
+        return f;
+    }
+
+    /**
+     * Shared gate for every DIAG site. Besides the debug option and the session cap, it refuses to COUNT lines while
+     * the shader pipeline is enabled but not yet capturing the world: hull draws happen during world-load warm-up
+     * (before initPipeline finishes), and in the 2026-08-03 sessions those meaningless prog=0 lines burned the whole
+     * 60-line budget before the steady state the probe exists to measure was ever reached.
+     */
+    private static boolean diagShouldLog() {
+        if (!SodiumClientMod.debugLogs() || diagLines >= DIAG_MAX_LINES) {
+            return false;
+        }
+        try {
+            com.yumelium.yumelium.shaders.pipeline.IrisPipeline p =
+                    com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance();
+            if (p.isEnabled() && !p.isCapturingWorld()) {
+                return false; // warm-up: pipeline on but not compiled/bound yet — don't spend the cap here
+            }
+        } catch (Throwable ignored) {
+        }
+        return true;
+    }
+
     /** DIAG: the hull method was reached (fires on every path, cache on or off; debug-gated + capped). Logs the GL
-     * truth of the moment — modelview translation, depth/blend/program — so a sane draw can be told from a doomed one. */
+     * truth of the moment — pass, entity bracket, modelview translation, depth/blend/program — so a sane draw can be
+     * told from a doomed one. */
     public static void diagHullEntered() {
-        if (SodiumClientMod.debugLogs() && diagLines < DIAG_MAX_LINES) {
+        if (diagShouldLog()) {
             diagLines++;
             java.nio.FloatBuffer mv = java.nio.ByteBuffer.allocateDirect(64).order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer();
             GL11.glGetFloat(GL11.GL_MODELVIEW_MATRIX, mv);
+            String pass = "off";
+            String entPass = "?";
+            try {
+                com.yumelium.yumelium.shaders.pipeline.IrisPipeline p =
+                        com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance();
+                if (p.isEnabled()) {
+                    pass = p.isShadowPass() ? "shadow" : "camera";
+                    entPass = String.valueOf(p.isEntityPassActive());
+                }
+            } catch (Throwable ignored) {
+            }
             SodiumClientMod.logger().info(String.format(
-                    "[procGeo DIAG] hull ENTER frame=%d entity=%s cacheEnabled=%s mvT=(%.2f,%.2f,%.2f) mvScale=%.3f depthTest=%s depthMask=%s blend=%s prog=%d",
-                    INSTANCE.frame,
+                    "[procGeo DIAG] hull ENTER frame=%d pass=%s entPass=%s entity=%s cacheEnabled=%s mvT=(%.2f,%.2f,%.2f) mvScale=%.3f depthTest=%s depthMask=%s blend=%s prog=%d",
+                    INSTANCE.frame, pass, entPass,
                     currentEntity() == null ? "null" : String.valueOf(currentEntity().getEntityId()),
                     enabled(),
                     mv.get(12), mv.get(13), mv.get(14), mv.get(0),
@@ -115,9 +171,29 @@ public final class ProceduralGeometryCache {
         }
     }
 
+    /** DIAG: vanilla's MULTIPASS block reached this entity ({@code RenderManager.renderMultipass} HEAD, called BEFORE
+     * our uniform/bind refresh so {@code prog} is what the block naturally carries). Filtered to the Betweenlands
+     * multipart classes so hull lines keep most of the cap. */
+    public static void diagMultipass(Entity entity) {
+        if (entity == null) {
+            return;
+        }
+        String name = entity.getClass().getName();
+        if (!name.contains("SludgeMenace") && !name.contains("Multipart")) {
+            return;
+        }
+        if (diagShouldLog()) {
+            diagLines++;
+            SodiumClientMod.logger().info("[procGeo DIAG] multipass ENTER frame=" + INSTANCE.frame
+                    + " entity=" + entity.getEntityId()
+                    + " class=" + entity.getClass().getSimpleName()
+                    + " prog=" + GL11.glGetInteger(org.lwjgl.opengl.GL20.GL_CURRENT_PROGRAM));
+        }
+    }
+
     /** DIAG: the uncached vanilla draw path ran, with the vertex count it is about to draw (pre-finish). */
     public static void diagVanillaDraw(BufferBuilder buffer) {
-        if (SodiumClientMod.debugLogs() && diagLines < DIAG_MAX_LINES) {
+        if (diagShouldLog()) {
             diagLines++;
             SodiumClientMod.logger().info("[procGeo DIAG] vanilla draw frame=" + INSTANCE.frame
                     + " count=" + buffer.getVertexCount() + " mode=" + buffer.getDrawMode());
@@ -158,7 +234,7 @@ public final class ProceduralGeometryCache {
         long now = System.currentTimeMillis();
         if (e != null && e.vertexCount > 0 && (this.frame - e.builtFrame) < updateInterval(entity)) {
             e.lastUsedMs = now;
-            if (SodiumClientMod.debugLogs() && diagLines < DIAG_MAX_LINES) {
+            if (diagShouldLog()) {
                 diagLines++;
                 GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, e.vbo);
                 java.nio.ByteBuffer check = java.nio.ByteBuffer.allocateDirect(12).order(java.nio.ByteOrder.nativeOrder());
@@ -213,7 +289,7 @@ public final class ProceduralGeometryCache {
                 }
                 GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, e.vbo);
                 GL15.glBufferData(GL15.GL_ARRAY_BUFFER, data, GL15.GL_DYNAMIC_DRAW);
-                if (SodiumClientMod.debugLogs() && diagLines < DIAG_MAX_LINES) {
+                if (diagShouldLog()) {
                     diagLines++;
                     // Read the first vertex back OUT of the VBO so an upload/readback mismatch is visible in the log.
                     java.nio.ByteBuffer check = java.nio.ByteBuffer.allocateDirect(12).order(java.nio.ByteOrder.nativeOrder());

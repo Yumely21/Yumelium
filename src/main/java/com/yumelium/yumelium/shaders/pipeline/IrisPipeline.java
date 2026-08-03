@@ -3694,6 +3694,11 @@ public final class IrisPipeline {
         }
     }
 
+    /** True between {@link #beginEntities} and {@link #endEntities} while the pack's entity program owns the pass. */
+    public boolean isEntityPassActive() {
+        return this.entitiesActive;
+    }
+
     // --- per-entity / per-item uniforms (mixin hooks; each no-ops unless its pass is live) -------------------------
 
     /**
