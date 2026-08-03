@@ -75,6 +75,17 @@ public class RenderSection {
     private int lastBuiltFrame = -1;
     private int lastSubmittedFrame = -1;
 
+    /**
+     * Shadow pass: this section is BURIED (fully under the heightmap) but kept in the shadow render list because it
+     * is near the camera — see RenderSectionManager.updateShadowRenderList's underground bubble. Buried geometry is
+     * single-sided (its sun-facing counterpart is unmeshed solid ground), so the light-facing slice cull's "the front
+     * face occludes anyway" assumption does not hold; the encode path must draw ALL slices for it or an underground
+     * room's walls cast nothing and volumetric light reads the room as sunlit (the BL decay-pit phantom beams,
+     * 2026-08-03). Written on every shadow-list build for every visited section; only read for sections in the
+     * current shadow list, so a stale value on an unvisited section is unreachable.
+     */
+    private boolean shadowKeepAllSlices;
+
     // Lifetime state
     private boolean disposed;
 
@@ -252,6 +263,15 @@ public class RenderSection {
 
     public boolean isDisposed() {
         return this.disposed;
+    }
+
+    public void setShadowKeepAllSlices(boolean keepAllSlices) {
+        this.shadowKeepAllSlices = keepAllSlices;
+    }
+
+    /** See the field doc: buried section kept in the shadow list near the camera — draw ALL slices in the shadow pass. */
+    public boolean shadowKeepAllSlices() {
+        return this.shadowKeepAllSlices;
     }
 
     @Override

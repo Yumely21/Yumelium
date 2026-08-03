@@ -191,13 +191,26 @@ public class RenderSectionManager {
     private static final int SHADOW_LIST_MAX_AGE = 600;
 
     /** Drop shadow-pass sections that are buried under the terrain — see {@link #isFullyUnderground}.
-     * NOTE (2026-08-03): bisected OFF against the BL decay-pit phantom light shafts — streaks unchanged, so this
-     * cull is EXONERATED for that bug (despite the shaft-light hole in the javadoc's soundness argument, which
-     * remains real in principle: sun through a tall open shaft reaches buried sections of neighbouring chunks
-     * crossing only air). Re-enabled. */
+     * NOTE (2026-08-03): the original form culled EVERY buried section, which — together with the light-facing slice
+     * cull — blinded the shadow map inside underground rooms and caused the BL decay-pit phantom volumetric beams
+     * (see {@link #SHADOW_UNDERGROUND_KEEP_RADIUS}). The first bisect flipped only THIS switch and the streaks
+     * survived via the slice cull, which mis-exonerated it: BOTH culls were killing the same wall faces. */
     private static final boolean SHADOW_CULL_UNDERGROUND = true;
     /** Blocks of slack below the chunk's lowest exposed column before a section counts as buried. One section's worth. */
     private static final int SHADOW_UNDERGROUND_MARGIN = 16;
+    /**
+     * Buried sections within this per-axis (Chebyshev) distance of the camera are KEPT in the shadow list — with
+     * ALL slices, see {@link RenderSection#shadowKeepAllSlices()} — instead of culled (2026-08-03, the BL decay-pit
+     * phantom beams). An underground room's only possible casters are its own walls: their sun-facing sides are
+     * buried solid ground and therefore UNMESHED, so occlusion rests entirely on the room-facing (light-BACK-facing)
+     * faces — which the plain underground cull removed wholesale and the light-facing slice cull removed exactly as
+     * well. With both gone, the volumetric-light march found empty shadow texels along every near-horizontal ray
+     * (the BL sun is FROZEN at celestialAngle 0.8 → ~18° elevation, javap-verified constant) and painted permanent
+     * sunrise-coloured beams through sealed rooms. The bubble restores local occlusion where it is visible (VL
+     * contrast lives near the camera) while distant buried terrain — the actual perf win — stays culled. Only
+     * sections with real geometry survive to the draw anyway (cave/room boundaries; solid interiors have no mesh).
+     */
+    private static final float SHADOW_UNDERGROUND_KEEP_RADIUS = 80.0F;
     /** Per-build cache of each chunk's minimum heightmap, so the 16 sections of a column share one lookup. */
     private final it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap chunkLowestHeight = new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap();
     private int shadowCulledUnderground;
@@ -544,16 +557,26 @@ public class RenderSectionManager {
                     && Math.abs(rx) <= voxHalf[0] + 16.0F + margin
                     && Math.abs(ry) <= voxHalf[1] + 16.0F + margin
                     && Math.abs(rz) <= voxHalf[2] + 16.0F + margin;
+            boolean keepAllSlices = false;
             if (!inVoxelVolume) {
                 if (pipeline.isSectionOutsideShadow(rx, ry, rz, margin)) {
                     continue;
                 }
                 if (SHADOW_CULL_UNDERGROUND && isFullyUnderground(section)) {
-                    culledUnderground++;
-                    continue;
+                    // Near-camera buried sections are the walls/ceilings of whatever underground space the camera is
+                    // in (or above) — the ONLY casters that can occlude it. Keep them, with all slices (their
+                    // sun-facing counterparts are unmeshed — see SHADOW_UNDERGROUND_KEEP_RADIUS). +margin: the cached
+                    // list must stay a superset for any camera drift below the rebuild threshold (per-axis 8 < margin).
+                    float keep = SHADOW_UNDERGROUND_KEEP_RADIUS + margin;
+                    if (Math.abs(rx) > keep || Math.abs(ry) > keep || Math.abs(rz) > keep) {
+                        culledUnderground++;
+                        continue;
+                    }
+                    keepAllSlices = true;
                 }
             }
 
+            section.setShadowKeepAllSlices(keepAllSlices);
             collector.visit(section, true);
             visited++;
         }

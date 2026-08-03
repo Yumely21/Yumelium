@@ -221,8 +221,15 @@ public class DefaultChunkRenderer extends ShaderChunkRenderer {
                 slices = getVisibleFaces(camera.intX, camera.intY, camera.intZ, chunkX, chunkY, chunkZ);
             } else if (shadowCull && !inVoxelVolume) {
                 // Light-facing slice cull. ALL inside the voxel volume — the shadow VERTEX shader is the voxelizer
-                // (imageStore), so every quad of a light source must still run its vertices there.
-                slices = shadowSliceMask; // == ALL on the TRANSLUCENT shadow sub-pass
+                // (imageStore), so every quad of a light source must still run its vertices there. ALL also for
+                // near-camera BURIED sections (RenderSection.shadowKeepAllSlices): buried geometry is single-sided —
+                // its sun-facing counterpart is unmeshed solid ground — so the slice cull's "the front face occludes
+                // anyway" premise fails and an underground room's walls would cast nothing (BL decay-pit phantom
+                // beams, 2026-08-03).
+                var section = renderRegion.getSection(sectionIndex);
+                slices = (section != null && section.shadowKeepAllSlices())
+                        ? ModelQuadFacing.ALL
+                        : shadowSliceMask; // == ALL on the TRANSLUCENT shadow sub-pass
             } else {
                 slices = ModelQuadFacing.ALL;
             }
