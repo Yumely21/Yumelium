@@ -1742,15 +1742,16 @@ public final class IrisPipeline {
         if (!SUN_LEAK_GATE || source == null || !source.contains("void DoLighting(inout vec4 color")) {
             return source;
         }
-        String replaced = source;
-        if (!replaced.contains("uniform float yl_UndergroundSurfaceY;")) {
-            replaced = replaced.replace("void DoLighting(inout vec4 color",
-                    "uniform float yl_UndergroundSurfaceY;\nvoid DoLighting(inout vec4 color");
-        }
-        if (!replaced.contains("uniform float yl_EyeSkylightRaw;")) {
-            replaced = replaced.replace("void DoLighting(inout vec4 color",
-                    "uniform float yl_EyeSkylightRaw;\nvoid DoLighting(inout vec4 color");
-        }
+        // Declarations are injected UNCONDITIONALLY. A contains() guard here was the 2026-08-04 vanilla-water
+        // regression: gbuffers_water's source DOES contain "uniform float yl_UndergroundSurfaceY;" — but only as
+        // TEXT inside reflectionBackground's `#if defined END && defined COMPOSITE` preprocessor-DEAD region
+        // (fixVlEmptyTexel rewrites it there without an anchor miss) — so the guard skipped the live declaration
+        // and the gate referenced an undeclared uniform: gbuffers_water failed to compile (C1503) and water fell
+        // back to the terrain program. No program has a LIVE duplicate to guard against: composite/composite1
+        // (live fixVlEmptyTexel declarations) contain GetVolumetricLight but never DoLighting, and this method
+        // runs exactly once per source.
+        String replaced = source.replace("void DoLighting(inout vec4 color",
+                "uniform float yl_UndergroundSurfaceY;\nuniform float yl_EyeSkylightRaw;\nvoid DoLighting(inout vec4 color");
         String verdict = "shadowMult *= GetShadow(shadowPos, lightmap.y, offset, shadowSamples, leaves, playerPos);";
         boolean tintMode = me.jellysquid.mods.sodium.client.SodiumClientMod.debugLogs();
         if (!tintMode) {
