@@ -933,14 +933,22 @@ public final class IrisPipeline {
 
     private static final String PLAYER_SHADOW_FSH =
             "#version 120\n" +
+            "uniform sampler2D tex;\n" +
             "varying vec2 texcoord;\n" +
             "varying vec4 vcolor;\n" +
             "void main() {\n" +
-            // NO alpha discard — parity with the pack: shadow.glsl never discards for ANY caster (entities included),
-            // so real Iris entity shadows are full-geometry. Our old `tex.a * vcolor.a < 0.1` discard made entity
-            // shadows depend on the resource pack's entity-texture alpha + whatever colour state the previous
-            // entity's layers left — which is exactly how the END endermen lost their shadows while the (opaque-
-            // skinned, first-in-list) player always kept his.
+            // TEXTURE-alpha discard (2026-08-03). The pack's shadow.glsl has no alpha discard of its own, but it
+            // outputs `gl_FragData[0].a = color1.a` (= the TEXTURE alpha — glColor only multiplies rgb) and relies on
+            // the HOST's fixed-function alpha test (GREATER 0.1, live in a compatibility profile even with a program
+            // bound) to kill transparent texels — DEPTH WRITE INCLUDED. Our old constant a=1.0 output defeated that
+            // test, so every transparent texel cast a fully opaque shadow: the Sludge Menace's decay-hole rings
+            // (large, mostly-transparent animated quads) stamped quad-shaped blockers into the shadow map and drew
+            // phantom light-shaft streaks through the boss room fog. Sampling ONLY the texture keeps parity with the
+            // pack's effective behaviour; deliberately NOT `tex.a * vcolor.a` — the stale-colour-state form is how
+            // the END endermen once lost their shadows (a previous entity's layer left vcolor.a≈0).
+            // Known edge: a caster drawing with texturing disabled samples whatever texture is still bound; accepted —
+            // entity renderers draw textured, and the reverse (constant a=1) is what produced the streaks.
+            "    if (texture2D(tex, texcoord).a < 0.1) discard;\n" +
             // Opaque-caster shadowcolor values, matching the lightweight terrain shadow fragment's opaque branch: no
             // colour tint + the pack's SALS height encoding at "caster at camera height".
             "    gl_FragData[0] = vec4(0.0, 0.0, 0.0, 1.0);\n" +
