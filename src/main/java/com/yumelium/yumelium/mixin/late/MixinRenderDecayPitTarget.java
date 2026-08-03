@@ -40,6 +40,7 @@ public class MixinRenderDecayPitTarget {
             at = @At(value = "INVOKE", target = "Lthebetweenlands/util/RenderUtils;getFrameCounter()I"),
             require = 1)
     private int yumelium$passSaltedFrameCounter() {
+        ProceduralGeometryCache.diagGuardEval("DecayPitTarget.doRender");
         return ProceduralGeometryCache.passSaltedFrame();
     }
 
@@ -47,6 +48,7 @@ public class MixinRenderDecayPitTarget {
             at = @At(value = "INVOKE", target = "Lthebetweenlands/util/RenderUtils;getFrameCounter()I"),
             require = 1)
     private int yumelium$passSaltedFrameCounterMultipass() {
+        ProceduralGeometryCache.diagGuardEval("DecayPitTarget.renderMultipass");
         return ProceduralGeometryCache.passSaltedFrame();
     }
 }

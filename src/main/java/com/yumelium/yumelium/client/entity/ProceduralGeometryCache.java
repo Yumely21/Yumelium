@@ -67,7 +67,7 @@ public final class ProceduralGeometryCache {
 
     /** DIAG (debug_logging-gated): logs capture uploads and replays with first-vertex readbacks, so a corrupted
      * replay can be told apart from a corrupted capture. Rate-capped per session. */
-    private static final int DIAG_MAX_LINES = 60;
+    private static final int DIAG_MAX_LINES = 120;
     private static int diagLines;
 
     private final Map<Integer, Entry> entries = new HashMap<>();
@@ -179,7 +179,7 @@ public final class ProceduralGeometryCache {
             return;
         }
         String name = entity.getClass().getName();
-        if (!name.contains("SludgeMenace") && !name.contains("Multipart")) {
+        if (!name.contains("SludgeMenace") && !name.contains("Multipart") && !name.contains("DecayPit")) {
             return;
         }
         if (diagShouldLog()) {
@@ -188,6 +188,27 @@ public final class ProceduralGeometryCache {
                     + " entity=" + entity.getEntityId()
                     + " class=" + entity.getClass().getSimpleName()
                     + " prog=" + GL11.glGetInteger(org.lwjgl.opengl.GL20.GL_CURRENT_PROGRAM));
+        }
+    }
+
+    /** DIAG: a pass-salted {@code renderedFrame} guard was EVALUATED (called from the MixinRenderDecayPitTarget
+     * redirects) — logs WHICH pass asked and the salted value handed back, so the log shows exactly who consumes
+     * each guard (the datum the 2026-08-04 "machinery still invisible" mystery needs). Debug-gated + capped. */
+    public static void diagGuardEval(String site) {
+        if (diagShouldLog()) {
+            diagLines++;
+            String pass = "off";
+            try {
+                com.yumelium.yumelium.shaders.pipeline.IrisPipeline p =
+                        com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance();
+                if (p.isEnabled()) {
+                    pass = p.isShadowPass() ? "shadow" : "camera";
+                }
+            } catch (Throwable ignored) {
+            }
+            SodiumClientMod.logger().info("[procGeo DIAG] guard EVAL site=" + site + " frame=" + INSTANCE.frame
+                    + " pass=" + pass + " salted=" + passSaltedFrame()
+                    + " entity=" + (currentEntity() == null ? "null" : String.valueOf(currentEntity().getEntityId())));
         }
     }
 

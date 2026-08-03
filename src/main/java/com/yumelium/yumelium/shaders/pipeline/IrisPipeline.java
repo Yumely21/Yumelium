@@ -1318,7 +1318,7 @@ public final class IrisPipeline {
             "gcolor", "gnormal", "composite", "gaux1", "gaux2", "gaux3", "gaux4",
             "depthtex0", "depthtex1", "depthtex2", "depthtex", "gdepth",
             "shadowtex0", "shadowtex1", "shadow", "watershadow", "shadowcolor0", "shadowcolor1",
-            "noisetex", "gtexture", "tex", "lightmap", "renderStage", "yl_ItemLightDir0", "yl_ItemLightDir1", "textureAtlas",
+            "noisetex", "gtexture", "tex", "lightmap", "renderStage", "yl_ItemLightDir0", "yl_ItemLightDir1", "yl_UndergroundSurfaceY", "textureAtlas",
             "specular", "normals",
         };
         java.util.Collections.addAll(PROVIDED_UNIFORMS, names);
@@ -1708,6 +1708,80 @@ public final class IrisPipeline {
         return replaced;
     }
 
+    /** Master switch for {@link #fixGbuffersShadowVerdict}. */
+    private static final boolean SUN_LEAK_GATE = true;
+    private boolean sunGateLogged;
+
+    /**
+     * Sun-leak gate for the DIRECT-LIGHT family (2026-08-04): the same unloaded-world empty-texel mechanism the VL
+     * gates close ({@link #fixVlEmptyTexel}) also leaks through the gbuffers shadow verdict — mainLighting.glsl's
+     * {@code DoLighting} multiplies {@code shadowMult} by {@code GetShadow()}, and an EMPTY shadow texel (clear
+     * depth 1.0) reads as FULLY SUNLIT with NO skylight gating inside shadow range (the pack's skyLightShadowMult
+     * applies only in the no-shadowmap path and the shadow-distance fade). That one verdict then feeds FOUR
+     * visible-light consumers: terrain diffuse sun, the GGX light highlight (mainLighting ~:836), the water
+     * reflection glint (reflectionBackground ~:27) and the water skyLightFactor hoist (commonFunctions ~:98) — all
+     * downstream multipliers of the SAME {@code shadowMult}, so ONE gate right after the verdict covers all four
+     * ({@code GetSkyLightFactor} runs after DoLighting has mutated its {@code inout shadowMult}).
+     *
+     * <p>Gate semantics = VL gate 2: fragments below {@code yl_UndergroundSurfaceY} scale the verdict by
+     * {@code eyeBrightnessM} — armed only at small rd (the uniform parks at −1e6 otherwise = strict no-op), and a
+     * daylight eye multiplies by ≈1. Both uniforms already reach every DoLighting program (setSceneUniforms via
+     * applyTerrainUniforms for chunk programs, useItemLitProgram/hand/textured for immediate-mode); only the GLSL
+     * declaration is injected, contains()-guarded against fixVlEmptyTexel's copy.</p>
+     *
+     * <p>DIAG MODE (one build, two behaviours): while debug_logging is ON at pipeline-compile time the GATE is
+     * replaced by TINTS — underground fragments whose RAW verdict stayed LIT go pure GREEN in gbuffers_terrain,
+     * MAGENTA in gbuffers_water, CYAN in every other DoLighting program (entities/block/hand/textured…); shadowed
+     * pixels are untouched (the diag-flood lesson). Toggle debug_logging in the GUI and press R to swap modes
+     * in-game — a single-variable A/B with no rebuild.</p>
+     *
+     * <p>Anchored on {@code DoLighting} itself so it only ever touches gbuffers programs: composite/composite1
+     * contain GetVolumetricLight (whose fixVlEmptyTexel-injected declaration would collide) but never DoLighting.</p>
+     */
+    private String fixGbuffersShadowVerdict(String source) {
+        if (!SUN_LEAK_GATE || source == null || !source.contains("void DoLighting(inout vec4 color")) {
+            return source;
+        }
+        String replaced = source;
+        if (!replaced.contains("uniform float yl_UndergroundSurfaceY;")) {
+            replaced = replaced.replace("void DoLighting(inout vec4 color",
+                    "uniform float yl_UndergroundSurfaceY;\nvoid DoLighting(inout vec4 color");
+        }
+        String verdict = "shadowMult *= GetShadow(shadowPos, lightmap.y, offset, shadowSamples, leaves, playerPos);";
+        boolean tintMode = me.jellysquid.mods.sodium.client.SodiumClientMod.debugLogs();
+        if (!tintMode) {
+            if (!replaced.contains(verdict)) {
+                me.jellysquid.mods.sodium.client.SodiumClientMod.logger().warn(
+                        "[Yumelium] sun-leak gate: GetShadow verdict anchor MISSED in a DoLighting program");
+                return replaced;
+            }
+            replaced = replaced.replace(verdict, verdict
+                    + " if ((playerPos.y + cameraPosition.y) < yl_UndergroundSurfaceY) shadowMult *= eyeBrightnessM;"
+                    + " // [yumelium] underground gate: an in-range LIT verdict is untrustworthy when the up-sun column may be unloaded");
+        } else {
+            String tintAnchor = "shadowMult *= max(NdotLM * shadowTime, 0.0);";
+            if (!replaced.contains(tintAnchor)) {
+                me.jellysquid.mods.sodium.client.SodiumClientMod.logger().warn(
+                        "[Yumelium] sun-leak DIAG tint anchor MISSED in a DoLighting program");
+                return replaced;
+            }
+            replaced = replaced.replace(tintAnchor, tintAnchor
+                    + "\n#if defined GBUFFERS_TERRAIN\n"
+                    + "            if ((playerPos.y + cameraPosition.y) < yl_UndergroundSurfaceY && shadowMult.r > 0.03) shadowMult = vec3(0.0, 30.0, 0.0); // [yumelium diag] GREEN = underground LIT terrain verdict\n"
+                    + "#elif defined GBUFFERS_WATER\n"
+                    + "            if ((playerPos.y + cameraPosition.y) < yl_UndergroundSurfaceY && shadowMult.r > 0.03) shadowMult = vec3(30.0, 0.0, 30.0); // [yumelium diag] MAGENTA = underground LIT water verdict\n"
+                    + "#else\n"
+                    + "            if ((playerPos.y + cameraPosition.y) < yl_UndergroundSurfaceY && shadowMult.r > 0.03) shadowMult = vec3(0.0, 30.0, 30.0); // [yumelium diag] CYAN = underground LIT other-gbuffers verdict\n"
+                    + "#endif");
+        }
+        if (!this.sunGateLogged) {
+            this.sunGateLogged = true;
+            log("gbuffers sun-leak " + (tintMode ? "DIAG TINTS (debug_logging on)" : "underground gate")
+                    + " applied to the DoLighting shadow verdict");
+        }
+        return replaced;
+    }
+
     /** Applies the active pack's option {@code #define} overrides + the Iris preprocessor defines before compilation. */
     private String applyOptions(String source) {
         if (source == null) {
@@ -1717,6 +1791,7 @@ public final class IrisPipeline {
                 injectWsrColorDebug(injectRefTemporalDebug(injectWsrTraceDebug(injectIrisDefines(shaderOptions().apply(source))))))))))));
         s = forcePackCloudsOff(s);
         s = fixVlEmptyTexel(s);
+        s = fixGbuffersShadowVerdict(s);
         // Raise the pack's Temporal Smoothing to reduce the variance-clamp flicker on bright colored light sources (see
         // TAA_SMOOTHING_OVERRIDE). Pure #define rewrite — the pack's common.glsl on disk is untouched.
         if (TAA_SMOOTHING_OVERRIDE != 3) {

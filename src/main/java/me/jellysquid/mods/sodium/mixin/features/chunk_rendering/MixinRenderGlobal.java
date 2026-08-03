@@ -169,14 +169,15 @@ public abstract class MixinRenderGlobal {
             // with shaders on? The hull probe proved the SHADOW pass reaches its renderer every frame while the
             // camera pass never does.
             final boolean yumelium$diagBoss = me.jellysquid.mods.sodium.client.SodiumClientMod.debugLogs()
-                    && entity.getClass().getName().contains("SludgeMenace")
+                    && entity.getClass().getName().startsWith("thebetweenlands.")
                     && ((yumelium$diagBossCounter++ & 0x1F) == 0);
+            final String yumelium$diagCls = yumelium$diagBoss ? entity.getClass().getSimpleName() : null;
 
             // Skip entities that shouldn't render in this pass
             if (!entity.shouldRenderInPass(pass)) {
                 if (yumelium$diagBoss) {
                     me.jellysquid.mods.sodium.client.SodiumClientMod.logger().info(
-                            "[bossGate DIAG] REJECTED by shouldRenderInPass(pass=" + pass + ")");
+                            "[bossGate DIAG] " + yumelium$diagCls + " REJECTED by shouldRenderInPass(pass=" + pass + ")");
                 }
                 continue;
             }
@@ -185,7 +186,7 @@ public abstract class MixinRenderGlobal {
             if (!this.renderManager.shouldRender(entity, camera, renderViewX, renderViewY, renderViewZ) && !entity.isRidingOrBeingRiddenBy(player)) {
                 if (yumelium$diagBoss) {
                     me.jellysquid.mods.sodium.client.SodiumClientMod.logger().info(
-                            "[bossGate DIAG] REJECTED by renderManager.shouldRender (box=" + entity.getRenderBoundingBox() + ")");
+                            "[bossGate DIAG] " + yumelium$diagCls + " REJECTED by renderManager.shouldRender (box=" + entity.getRenderBoundingBox() + ")");
                 }
                 continue;
             }
@@ -194,12 +195,12 @@ public abstract class MixinRenderGlobal {
             if (!yumelium$renderer.isEntityVisible(entity)) {
                 if (yumelium$diagBoss) {
                     me.jellysquid.mods.sodium.client.SodiumClientMod.logger().info(
-                            "[bossGate DIAG] REJECTED by isEntityVisible (box=" + entity.getRenderBoundingBox() + ")");
+                            "[bossGate DIAG] " + yumelium$diagCls + " REJECTED by isEntityVisible (box=" + entity.getRenderBoundingBox() + ")");
                 }
                 continue;
             }
             if (yumelium$diagBoss) {
-                me.jellysquid.mods.sodium.client.SodiumClientMod.logger().info("[bossGate DIAG] PASSED all gates -> renderEntityStatic");
+                me.jellysquid.mods.sodium.client.SodiumClientMod.logger().info("[bossGate DIAG] " + yumelium$diagCls + " PASSED all gates -> renderEntityStatic");
             }
 
             if ((entity != renderViewEntity || yumelium$thirdPerson || yumelium$isSleeping)
