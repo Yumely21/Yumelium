@@ -5,6 +5,7 @@
   "target": "@env(DEFAULT)",
   "client": [
     "MixinEntityRendererCameraClip",
+    "MixinTextureMapAtlasScope",
     "MixinTextureUtilMipmap"
   ],
   "mixins": [],

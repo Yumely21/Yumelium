@@ -70,4 +70,49 @@ public class MixinTextureUtilMipmap {
         }
         cir.setReturnValue(alpha << 24 | red << 16 | green << 8 | blue);
     }
+
+    /** Alpha at or below this (out of 255) is floored to exactly 0. See the blast-radius audit in the javadoc below
+     * before changing: 8 catches every fake-transparent texel found in the scanned corpus (max was 8), while 9+
+     * starts eating energy_barrier.png's real 9–32 gradient band. */
+    private static final int ALPHA_FLOOR_MAX = 8;
+
+    /**
+     * Block-atlas alpha floor (2026-08-04): texels shipped at alpha 1–8/255 — Betweenlands' "transparent"
+     * plant/algae texels; algae_N.png contains NO true alpha-0 pixels at all — are floored to alpha 0 at sprite
+     * load, BEFORE mip generation. Vanilla's fixed-function alpha test (0.1) never drew them in ANY layer, but the
+     * pack's terrain discard (a &lt;= 0.00001) and gbuffers_water alphaTest (GREATER 0.0001) pass them, rendering a
+     * near-invisible film whose DEPTH writes punch holes in late depth-tested draws (BL gas clouds); with
+     * ANISOTROPIC_FILTER the sqrt boost even lifts them over the hardened 0.1 cutoff (sqrt(8/255) = 0.177).
+     * Flooring the DATA fixes every consumer at once: terrain, water, AF (sqrt(0) = 0), Nvidium, vanilla.
+     *
+     * <p>{@code generateMipmapData} aliases {@code result[0] = data[0]} (same array reference), so this in-place
+     * mutation reaches both the uploaded level-0 texels and every mip input; it runs BEFORE the method's own
+     * hasTransparency scan, so the alpha-weighted blend above engages and floored texels stop contributing RGB to
+     * mip colours. RGB is KEPT (mask 0x00FFFFFF): every contributor test keys on alpha alone, and the artist's
+     * under-colour is better for GL_LINEAR edge filtering than transparent black. Thread-safe by construction —
+     * VintageFix runs this on ForkJoinPool workers (one volatile read + pure per-call array mutation).</p>
+     *
+     * <p>Scoped to the block atlas via {@code YumeliumMod.BLOCK_ATLAS_LOADING} (MixinTextureMapAtlasScope brackets
+     * {@code TextureMap.loadSprites} — deliberately the CALLER of loadTextureAtlas, where VintageFix injects its
+     * preload, so the flag is set strictly before VF's workers start and cleared after VF's blocking wait ends).
+     * Kill switch: {@code YumeliumMod.ATLAS_ALPHA_FLOOR}.</p>
+     */
+    @Inject(method = "generateMipmapData(II[[I)[[I", at = @At("HEAD"), require = 1)
+    private static void yumelium$floorNearZeroAlpha(int mipmapLevels, int width, int[][] data,
+                                                    CallbackInfoReturnable<int[][]> cir) {
+        if (!com.yumelium.yumelium.YumeliumMod.ATLAS_ALPHA_FLOOR
+                || !com.yumelium.yumelium.YumeliumMod.BLOCK_ATLAS_LOADING) {
+            return;
+        }
+        int[] level0 = data[0];
+        if (level0 == null) {
+            return;
+        }
+        for (int i = 0; i < level0.length; i++) {
+            int a = level0[i] >>> 24;
+            if (a != 0 && a <= ALPHA_FLOOR_MAX) {
+                level0[i] &= 0x00FFFFFF; // alpha -> 0, RGB kept
+            }
+        }
+    }
 }
