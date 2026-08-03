@@ -44,6 +44,16 @@ public class YumeliumMod {
     }
 
     @Mod.EventHandler
+    public void serverStarting(net.minecraftforge.fml.common.event.FMLServerStartingEvent event) {
+        // /ylbench (multi-Sludge-Menace render benchmark, task #15). Server commands execute on the integrated-server
+        // thread — spawning needs no marshalling. Physical-side gate: the command class references client classes, so
+        // a dedicated server must never classload it.
+        if (net.minecraftforge.fml.common.FMLCommonHandler.instance().getSide() == Side.CLIENT) {
+            event.registerServerCommand(new com.yumelium.yumelium.client.bench.YlBenchCommand());
+        }
+    }
+
+    @Mod.EventHandler
     public void postInit(FMLPostInitializationEvent event) {
         // FermiumASM registers its SRG-hardcoded F3 stats handler in loadComplete (AFTER postInit) — install a
         // one-shot first-tick fixer that pulls it off the bus in dev runtimes (production is left untouched).

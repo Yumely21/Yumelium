@@ -70,6 +70,20 @@ public final class ProceduralGeometryCache {
     private static final int DIAG_MAX_LINES = 120;
     private static int diagLines;
 
+    // --- /ylbench counters (NOT diag-gated — the bench reads them regardless of debug_logging) -------------------
+    private static int benchBuilds;
+    private static int benchReplays;
+
+    /** @return {builds, replays} accumulated since the last {@link #benchResetCounters}. */
+    public static int[] benchSnapshot() {
+        return new int[]{benchBuilds, benchReplays};
+    }
+
+    public static void benchResetCounters() {
+        benchBuilds = 0;
+        benchReplays = 0;
+    }
+
     private final Map<Integer, Entry> entries = new HashMap<>();
     private final WorldVertexBufferUploader uploader = new WorldVertexBufferUploader();
 
@@ -266,6 +280,7 @@ public final class ProceduralGeometryCache {
                         this.frame, e.builtFrame, e.vbo, e.vertexCount,
                         check.getFloat(0), check.getFloat(4), check.getFloat(8)));
             }
+            benchReplays++;
             draw(e);
             return true;
         }
@@ -328,6 +343,7 @@ public final class ProceduralGeometryCache {
                 e.drawMode = buffer.getDrawMode();
                 e.format = format;
                 e.builtFrame = this.frame;
+                benchBuilds++;
             } else {
                 e.vertexCount = 0;
             }

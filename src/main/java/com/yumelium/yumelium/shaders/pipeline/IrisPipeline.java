@@ -1247,6 +1247,38 @@ public final class IrisPipeline {
         this.shadowEntTesrNanos += System.nanoTime() - t;
     }
 
+    // --- /ylbench getters. The per-frame CPU fields reset in beginWorldRender, so these are only valid sampled at
+    // RenderTickEvent phase END (after the world render, before the next frame's reset) — BenchSession does exactly
+    // that. benchGpuReport works WITHOUT DIAG_GPU_TIME: the flag gates only the log line, the timer queries run
+    // unconditionally every frame (EMA alpha 0.1, ~30 frames to settle; null when unsupported).
+    public long benchCameraEntityCpuNanos() {
+        return this.cpuCameraEntitiesNanos;
+    }
+
+    public int benchCameraEntityPasses() {
+        return this.cpuCameraEntitiesCalls;
+    }
+
+    public long benchShadowEntityCpuNanos() {
+        return this.cpuShadowEntitiesNanos;
+    }
+
+    public long benchShadowEntSetupNanos() {
+        return this.shadowEntSetupNanos;
+    }
+
+    public long benchShadowEntDrawNanos() {
+        return this.shadowEntDrawNanos;
+    }
+
+    public long benchShadowEntTesrNanos() {
+        return this.shadowEntTesrNanos;
+    }
+
+    public String benchGpuReport() {
+        return this.profiler.report();
+    }
+
     /** Entity counts for the GPU TIME line: shadow casters actually drawn, and the leash-gate tallies. */
     private String entityDiagSuffix() {
         try {
