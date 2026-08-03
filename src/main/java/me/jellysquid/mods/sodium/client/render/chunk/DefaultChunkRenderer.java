@@ -73,7 +73,7 @@ public class DefaultChunkRenderer extends ShaderChunkRenderer {
         // skipped outside the voxel volume (see getLightFacingSlices). TRANSLUCENT stays full — it is the
         // caustics/shadowcolor + translucent-emitter voxelization pass, and it can be index-sorted.
         int shadowSliceMask = ModelQuadFacing.ALL;
-        if (shadowPass && renderPass != me.jellysquid.mods.sodium.client.render.chunk.terrain.DefaultTerrainRenderPasses.TRANSLUCENT) {
+        if (SHADOW_SLICE_CULL && shadowPass && renderPass != me.jellysquid.mods.sodium.client.render.chunk.terrain.DefaultTerrainRenderPasses.TRANSLUCENT) {
             shadowSliceMask = getLightFacingSlices(
                     com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().shadowLightDirection());
         }
@@ -269,6 +269,12 @@ public class DefaultChunkRenderer extends ShaderChunkRenderer {
     private static final int MODEL_NEG_X      = ModelQuadFacing.NEG_X.ordinal();
     private static final int MODEL_NEG_Y      = ModelQuadFacing.NEG_Y.ordinal();
     private static final int MODEL_NEG_Z      = ModelQuadFacing.NEG_Z.ordinal();
+
+    /** Master switch for the light-facing slice cull (bisect lever, normally ON). Bisected OFF 2026-08-03 against
+     * the BL decay-pit phantom beams: beams unchanged — the cull is exonerated for that bug (they were the VL far
+     * branch, no occlusion involved). Near-camera BURIED sections are exempted per-section regardless — see
+     * RenderSection.shadowKeepAllSlices — because single-sided buried walls remain a real slice-cull hole. */
+    private static final boolean SHADOW_SLICE_CULL = true;
 
     // Epsilon band for light-facing slice culling in the shadow pass: keeps slices that are near edge-on to the
     // light. Must cover the pack shadow vertex's DoWave leaf tilt (a few degrees) and the sunPathRotation=0 case

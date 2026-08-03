@@ -509,7 +509,7 @@ public final class IrisPipeline {
     // both failed. The integrated on-screen hue then IS the GPU's answer: mostly-black = the raw shadowtex0 fetch reads
     // 0 (compare-flip broken for composite1), red-without-green = the ==1.0 equality on shadowtex1 never passes, green =
     // the branch fires and the zero is in shadowcolor1's content. CPU probes could not see this (they bypass samplers).
-    private static final boolean DIAG_VL_BRANCH_COLORS = false;
+    private static final boolean DIAG_VL_BRANCH_COLORS = false; // beam-hunt verdict 2026-08-03: beams showed RED = the near branch's genuine depth-compare LIT (up-sun occluder unloaded)
     // RAYEND bisect: the raw-VL view shows geometry-terminated rays near-black vs bright sky rays, split at the floor's
     // visual horizon — as if the march is cut almost immediately when the ray ends on geometry. rayEnd = min(lViewPos1,
     // maxDistance) with lViewPos1 from OUR depthtex1; forcing the full march decides it: samples past the floor read
@@ -534,7 +534,7 @@ public final class IrisPipeline {
     // composite chain, ~1/second. Off: it costs ~50 single-texel GPU readbacks a second. Turn on to re-check the light
     // shafts' vlFactor adaptation — but read vlFactor itself, not diagSals's salsCheck verdict, which runs ~10% under the
     // shader's (it fetches one exact texel where the shader LINEAR-filters, and samples at a different instant).
-    private static final boolean DIAG_SHADOW_POS = false; // SALS verified working under BEHAVIOUR=1 (2026-07-27): open=skip, forest=4.6, flat=0 — thresholds behave like real 1.20.1
+    private static final boolean DIAG_SHADOW_POS = false; // beam-hunt probe (now reads shadowtex1 + colored-branch verdict + eyeBrightness per point)
     // Logs the underwater VL shadow probe (diagUnderwaterShadow): GL-truth reads of shadowtex0/1 + shadowcolor0/1 at
     // camera-relative points while submerged, ~1/second — the measured branch decides the god-ray fix, not theory.
     private static final boolean DIAG_UW_SHADOW = false;
@@ -595,6 +595,16 @@ public final class IrisPipeline {
     // pack's SSR rejects it), RED = 0.0 (broken — SSR would accept a "hit" on every sky pixel and sample colortex0, i.e.
     // the screen's own image, into the wet-floor reflection), GREEN = real geometry depth.
     private static final boolean DIAG_SHOW_DEPTHTEX1 = false;
+    /**
+     * Shadow-bank viewer (2026-08-03, the BL decay-pit phantom-beam hunt): paints four vertical strips, each showing
+     * the WHOLE shadow map — |1: shadowtex0 depth |2: shadowtex1 (opaque snapshot) depth |3: the DISAGREEMENT map
+     * |4: shadowcolor1.rgb|. Depth strips: grayscale (contrast-stretched around the z-squashed band), DARK BLUE =
+     * empty texel (no caster, depth 1.0). Strip 3 is the decisive one — it is exactly the VL march's
+     * translucent-caster trigger: RED = shadowtex0 nearer than shadowtex1 (the march takes the shadowcolor1-coloured
+     * shaft branch there), GREEN = maps agree (opaque shadow), BLACK = both empty, MAGENTA = impossible ordering.
+     * The boss-room question in one screenshot: do the room's walls exist in strip 2, and is the map centre RED?
+     */
+    private static final boolean DIAG_SHOW_SHADOW_BANK = false;
     // One-shot numeric readback of depthTex -> waterDepthTex -> depthtex1 (see RenderTargets#diagDepthChain), to locate
     // which link of the chain breaks instead of inferring it from the colour-coded screen.
     private static final boolean DIAG_DEPTH_CHAIN = false;
@@ -629,6 +639,7 @@ public final class IrisPipeline {
             "uniform float diagRefTemporal;\n" +
             "uniform float diagColortex4a;\n" +
             "uniform float diagHandMcbl;\n" +
+            "uniform float diagShadowBank;\n" +
             "varying vec2 texcoord;\n" +
             "void main() {\n" +
             // The no-final fallback / DIAG viewer: sample the composites' finished colour (bound on unit 0) and output
@@ -655,6 +666,29 @@ public final class IrisPipeline {
             "        if (z1 >= 0.9999) c = vec3(0.0, 0.0, 1.0);\n" +        // BLUE  = 1.0 far/sky (correct → SSR rejects)
             "        else if (z1 <= 0.0001) c = vec3(1.0, 0.0, 0.0);\n" +   // RED   = 0.0 (BROKEN → SSR accepts everywhere)
             "        else c = vec3(0.0, 1.0, 0.0) * (1.0 - pow(z1, 64.0));\n" + // GREEN = real geometry depth
+            "    }\n" +
+            // Shadow-bank viewer — see the DIAG_SHOW_SHADOW_BANK field doc. Units while active: 2 = shadowtex0 (raw
+            // depth, compare off), 3 = shadowtex1 opaque snapshot (raw depth), 4 = shadowcolor1. Four strips, each
+            // showing the WHOLE map; strip 3 = the VL translucent-branch trigger (RED = shadowtex0 nearer).
+            "    if (diagShadowBank > 0.5) {\n" +
+            "        vec2 sc = vec2(fract(texcoord.x * 4.0), texcoord.y);\n" +
+            "        float d0 = texture2D(colortex4diag, sc).r;\n" +
+            "        float d1 = texture2D(depthtex1diag, sc).r;\n" +
+            "        if (texcoord.x < 0.25) {\n" +
+            "            c = vec3(clamp((d0 - 0.30) * 2.5, 0.0, 1.0));\n" +
+            "            if (d0 >= 0.9999) c = vec3(0.0, 0.0, 0.30);\n" +   // dark blue = EMPTY (no caster)
+            "        } else if (texcoord.x < 0.5) {\n" +
+            "            c = vec3(clamp((d1 - 0.30) * 2.5, 0.0, 1.0));\n" +
+            "            if (d1 >= 0.9999) c = vec3(0.0, 0.0, 0.30);\n" +
+            "        } else if (texcoord.x < 0.75) {\n" +
+            "            float diff = d1 - d0;\n" +
+            "            if (d0 >= 0.9999 && d1 >= 0.9999) c = vec3(0.0);\n" +          // both empty
+            "            else if (diff > 0.0005) c = vec3(1.0, 0.0, 0.0);\n" +          // RED: translucent-branch zone
+            "            else if (diff < -0.0005) c = vec3(1.0, 0.0, 1.0);\n" +         // MAGENTA: impossible ordering
+            "            else c = vec3(0.0, 0.5, 0.0);\n" +                             // GREEN: maps agree
+            "        } else {\n" +
+            "            c = texture2D(colortex7diag, sc).rgb;\n" +                     // shadowcolor1 rgb
+            "        }\n" +
             "    }\n" +
             // Show the composite's WSR output (colortex7 = reflectOutput). Its ALPHA is what composite1 blends the
             // world-space reflection in with on the water path (`mix(ssrReflection.rgb, compositeReflection.rgb,
@@ -930,6 +964,52 @@ public final class IrisPipeline {
             "    texcoord = (gl_TextureMatrix[0] * gl_MultiTexCoord0).st;\n" +
             "    vcolor = gl_Color;\n" +
             "}\n";
+
+    /**
+     * The "world continues" curtain (2026-08-03, the BL decay-pit phantom beams, final layer). At small render
+     * distances the shadow map only contains the loaded world, so for an underground sample the REAL occluder — the
+     * terrain surface 100+ blocks toward a low sun — often is not loaded at all. Columns whose loaded content is
+     * only DEEPER than the sample then depth-compare as "sunlit" (probe- and branch-color-verified: the beams are
+     * the near branch's genuine LIT verdicts), and no empty-texel handling can catch them because the texel is NOT
+     * empty. The curtain draws an annulus of synthetic ground at the local surface height over the UNLOADED region,
+     * so those columns read "occluded at surface height" — exactly what the missing terrain would have written.
+     * Genuine sky gaps inside the loaded ring are untouched (the annulus starts at the loaded boundary). Drawn
+     * BEFORE snapshotOpaqueShadowDepth so shadowtex0 and shadowtex1 agree (no phantom translucent-caster branch).
+     * Skipped entirely once the loaded radius covers the shadow box (rd >= ~20).
+     *
+     * <p>SUPERSEDED (2026-08-03, same evening): the flat-plane approximation double-shadowed real terrain BELOW the
+     * local average height (valleys) on the surface. Replaced by the shader-side underground gate in
+     * {@link #fixVlEmptyTexel} — no synthetic geometry, no false occluders; kept in-tree as the fallback in case a
+     * future pack version breaks that rewrite's anchors.</p>
+     */
+    private static final boolean UNLOADED_WORLD_CURTAIN = false;
+
+    private static final String CURTAIN_VSH =
+            "#version 120\n" +
+            "uniform mat4 yl_ShadowMVP;\n" +
+            "uniform float shadowMapBias;\n" +
+            "void main() {\n" +
+            "    vec4 clip = yl_ShadowMVP * gl_Vertex;\n" +
+            "    float distb = length(clip.xy);\n" +
+            "    float distortFactor = (1.0 - shadowMapBias) + distb * shadowMapBias;\n" +
+            "    clip.xy /= distortFactor;\n" +
+            "    clip.z *= 0.2;\n" +
+            "    gl_Position = clip;\n" +
+            "}\n";
+
+    private static final String CURTAIN_FSH =
+            "#version 120\n" +
+            "void main() {\n" +
+            // Opaque-caster shadowcolor constants, same as the terrain/entity opaque branches: no tint, SALS height
+            // "at camera level" (decodes to 0 → neutral for the scene-aware probe).
+            "    gl_FragData[0] = vec4(0.0, 0.0, 0.0, 1.0);\n" +
+            "    gl_FragData[1] = vec4(vec3(0.3), 0.25);\n" +
+            "}\n";
+
+    private GlslProgram curtainProgram;
+
+    /** Per-frame threshold for the VL underground gate — local average surface − 8, or −1e6 when gated off. */
+    private float undergroundSurfaceY = -1.0e6F;
 
     private static final String PLAYER_SHADOW_FSH =
             "#version 120\n" +
@@ -1487,6 +1567,68 @@ public final class IrisPipeline {
         return CLOUD_STYLE_DEFINE.matcher(source).replaceAll("#define CLOUD_STYLE_DEFINE 0");
     }
 
+    /** One-shot "the VL empty-texel rewrite actually matched" log latch — see {@link #fixVlEmptyTexel}. */
+    private boolean vlEmptyTexelLogged;
+
+    /**
+     * VL march, EMPTY shadow texels (source rewrite; the pack on disk is untouched). To the pack, a shadow-map texel
+     * at clear depth 1.0 means "nothing between here and the sun" = fully sunlit — correct for genuine sky columns,
+     * WRONG for columns that simply have NO DATA because they exit the loaded world. Underground the real occluder
+     * for a near-horizontal sun (the BL's is frozen at ~18°) sits 100+ blocks up-sun — unloaded at small render
+     * distances — so sealed caves/dungeon rooms accumulated "sunlit" fog along exactly the rays whose sun columns
+     * missed all loaded geometry: the decay-pit phantom beams (probe-verified 2026-08-03: probe points behind
+     * loaded structure read correctly SHADOWED; the beams live in the empty-texel directions; rd16 leaves faint
+     * residues because the ±(shadowDistance+96) along-sun columns still exit the 256-block loaded ring).
+     *
+     * <p>The fix reuses the pack's OWN far-field approximation: beyond {@code min(far, shadowDistance) * 0.98} the
+     * march already stops shadow-testing and uses {@code localDensity = eyeBrightnessM} (the smoothed eye sky-light).
+     * Empty texels now do the same instead of reading as sunlit: pitch-black interiors get 0 (dark — beams gone at
+     * every render distance), open surface terrain gets ~1 (identical to the old behaviour), cave mouths blend.
+     * Anchored on the march's compare line right after the {@code 28A3DK6} texelFetch; {@code eyeBrightnessM} is in
+     * scope by construction (the same function's far-field branch reads it). Loud warn on anchor miss.</p>
+     */
+    /** Master switch for the unloaded-world VL rewrites below. Bisected OFF once (2026-08-03) against the overworld
+     * "double shadows + de-blued water" report — symptoms persisted, so the rewrite is exonerated (they were
+     * leftover test settings: SHADOW_QUALITY=0 disables colored shadows = water transmission AND simplifies shadow
+     * filtering). Back ON — it is the decay-pit phantom-beam fix. */
+    private static final boolean VL_UNLOADED_FIX = true;
+
+    private String fixVlEmptyTexel(String source) {
+        if (!VL_UNLOADED_FIX || source == null || !source.contains("GetVolumetricLight")) {
+            return source; // program doesn't inline volumetricLight.glsl — not a miss
+        }
+        String anchor = "shadowSample = clamp((shadowSample - shadowPos.z) * 65536.0, 0.0, 1.0);";
+        // Two layers, same root cause (the shadow map cannot testify about the UNLOADED world):
+        //  1. empty texel (raw depth 1.0) — no caster data at all → the pack's own far-field approximation.
+        //  2. the UNDERGROUND GATE — a LIT verdict for a sample meaningfully below the local surface is only
+        //     trustworthy when the up-sun column was loaded; branch-color diagnosis proved the decay-pit beams were
+        //     exactly these (RED = genuine depth-compare LIT, occluder unloaded, texel NOT empty — only deeper
+        //     geometry in the column). Scale those verdicts by eyeBrightnessM: an eye in darkness (the phantom
+        //     situation) kills them; an eye in daylight (a valley floor, a lit pit — where a false kill would show)
+        //     multiplies by ~1.0 and changes nothing. yl_UndergroundSurfaceY is fed per frame (local average surface
+        //     − 8) and parked at -1e6 once the loaded world covers the shadow box, making the gate a strict no-op at
+        //     normal render distances. This replaced the synthetic "world continues" curtain geometry, whose flat
+        //     plane double-shadowed real valleys below the average height.
+        String replaced = source.replace(anchor,
+                "shadowSample = shadowSample >= 1.0 ? eyeBrightnessM"
+                        + " : clamp((shadowSample - shadowPos.z) * 65536.0, 0.0, 1.0);"
+                        + " // [yumelium] empty texel = UNLOADED world, not sky: use the pack's own far-field approximation\n"
+                        + "                    if ((scenePos.y + cameraPosition.y) < yl_UndergroundSurfaceY) shadowSample *= eyeBrightnessM;"
+                        + " // [yumelium] underground gate: a LIT verdict below the surface is untrustworthy when the up-sun column may be unloaded");
+        if (replaced.equals(source)) {
+            me.jellysquid.mods.sodium.client.SodiumClientMod.logger().warn(
+                    "[Yumelium] VL empty-texel rewrite anchor MISSED - unloaded-world light shafts (small-rd phantom beams) will be back");
+            return source;
+        }
+        replaced = replaced.replace("vec4 GetVolumetricLight(inout float vlFactor",
+                "uniform float yl_UndergroundSurfaceY;\nvec4 GetVolumetricLight(inout float vlFactor");
+        if (!this.vlEmptyTexelLogged) {
+            this.vlEmptyTexelLogged = true;
+            log("VL empty-shadow-texel + underground-gate rewrite applied (unloaded world no longer reads as sunlit)");
+        }
+        return replaced;
+    }
+
     /** Applies the active pack's option {@code #define} overrides + the Iris preprocessor defines before compilation. */
     private String applyOptions(String source) {
         if (source == null) {
@@ -1495,6 +1637,7 @@ public final class IrisPipeline {
         String s = injectVlForceRayEnd(injectShaftFloorFix(injectShowVolumetricLight(injectVlBranchColors(injectHandDepthFix(injectVolumetricLightDebug(injectWsrColorOutput(
                 injectWsrColorDebug(injectRefTemporalDebug(injectWsrTraceDebug(injectIrisDefines(shaderOptions().apply(source))))))))))));
         s = forcePackCloudsOff(s);
+        s = fixVlEmptyTexel(s);
         // Raise the pack's Temporal Smoothing to reduce the variance-clamp flicker on bright colored light sources (see
         // TAA_SMOOTHING_OVERRIDE). Pure #define rewrite — the pack's common.glsl on disk is untouched.
         if (TAA_SMOOTHING_OVERRIDE != 3) {
@@ -1828,6 +1971,10 @@ public final class IrisPipeline {
         s = s.replace(transAnchor,
                 "float translucentShadowSample = shadow2D(shadowtex1, shadowPos.xyz).z;\n"
                 + "                            localDensity = vec3(0.0, translucentShadowSample, 1.0 - translucentShadowSample); // [diag] G=pass B=fail");
+        // FAR-field samples (beyond min(far, shadowDistance)*0.98 — the eyeBrightnessM approximation, no shadow test)
+        // forced to a visible BLUE regardless of eye brightness, so their contribution is unmistakable in the beams.
+        s = s.replace("localDensity = vec3(eyeBrightnessM);",
+                "localDensity = vec3(0.0, 0.0, 0.3); // [diag] FAR-branch samples show BLUE");
         return s;
     }
 
@@ -2368,6 +2515,7 @@ public final class IrisPipeline {
                 this.depthCopyProgram = GlslProgram.compile("iris_depthcopy", DEFAULT_FULLSCREEN_VSH, DEPTH_COPY_FSH);
                 this.handReflectFixProgram = GlslProgram.compile("iris_handreflectfix", DEFAULT_FULLSCREEN_VSH, HAND_REFLECT_FIX_FSH);
                 this.playerShadowProgram = GlslProgram.compile("iris_playershadow", PLAYER_SHADOW_VSH, PLAYER_SHADOW_FSH);
+                this.curtainProgram = GlslProgram.compile("iris_unloadedcurtain", CURTAIN_VSH, CURTAIN_FSH);
                 compilePrepare(pack);
                 compileChain(pack, "deferred", this.deferredPrograms);
                 compileChain(pack, "composite", this.compositePrograms);
@@ -4817,7 +4965,8 @@ public final class IrisPipeline {
                 + ") sproj[3]=(" + String.format("%.4f,%.4f,%.4f",
                 this.shadowProjection.m30(), this.shadowProjection.m31(), this.shadowProjection.m32()) + ")");
         // Player-space (camera-relative) probe points, the space GetVolumetricLight marches scenePos through.
-        float[][] probes = {{0, 0, 0}, {0, 0, -4}, {0, 0, -16}, {0, 0, -64}, {0, 0, -150}, {64, 0, -64}};
+        // Room-scale ring around the camera (the decay-pit beams cross within a few blocks) + the older far points.
+        float[][] probes = {{0, 0, 0}, {8, 0, 0}, {-8, 0, 0}, {0, 0, 8}, {0, 0, -8}, {0, 4, 0}, {0, 0, -16}, {0, 0, -64}};
         for (float[] p : probes) {
             // PlayerToShadow: mat3(shadowModelView) * pos + shadowModelView[3].xyz
             org.joml.Vector3f v = this.shadowModelView.transformPosition(new org.joml.Vector3f(p[0], p[1], p[2]));
@@ -4844,12 +4993,31 @@ public final class IrisPipeline {
                 // then shadowSample = clamp((depth - shadowPos.z) * 65536.0, 0.0, 1.0). 0 = "in shadow" (kills the shaft
                 // sample), 1 = "lit". An all-zero depth means the raw-depth read is broken, NOT that the world is shadowed.
                 int res = this.targets.shadowSize();
-                float depth = this.targets.readShadowDepthTexel((int) (sx * res), (int) (sy * res));
+                int tx = (int) (sx * res);
+                int ty = (int) (sy * res);
+                float depth = this.targets.readShadowDepthTexel(tx, ty);
                 float shadowSample = Math.max(0.0F, Math.min(1.0F, (depth - sz) * 65536.0F));
-                sb.append(" | depth=").append(String.format("%.5f", depth))
+                sb.append(" | tex0=").append(String.format("%.5f", depth))
                         .append(" vs z=").append(String.format("%.5f", sz))
-                        .append(" -> shadowSample=").append(String.format("%.0f", shadowSample))
-                        .append(shadowSample > 0.0F ? " (LIT)" : " (SHADOWED)");
+                        .append(shadowSample > 0.0F ? " -> LIT" : " -> SHADOWED");
+                if (shadowSample == 0.0F) {
+                    // The VL march's second gate (volumetricLight.glsl): shadowtex0 shadowed + shadowtex1 (opaque
+                    // snapshot) NOT shadowed => "translucent caster above" => the sample is painted with
+                    // pow2(shadowcolor1.rgb * 4.0) — for our opaque-branch constant 0.3 grey that is ~1.44, BRIGHTER
+                    // THAN FULL SUNLIGHT. If a probe point inside the sealed boss room hits this branch, the phantom
+                    // beams are exactly this, and tex0-vs-tex1 disagreement at that texel is the thing to explain.
+                    float depth1 = this.targets.readShadowDepthOpaqueTexel(tx, ty);
+                    boolean opaqueLit = sz <= depth1; // shadow2D LEQUAL: passes (=1.0, "not shadowed") when z <= stored
+                    sb.append(" tex1=").append(String.format("%.5f", depth1));
+                    if (opaqueLit) {
+                        float[] c1 = this.targets.readShadowColorTexel(true, tx, ty);
+                        sb.append(" -> *** COLORED BRANCH (beam) shadowcolor1=")
+                                .append(String.format("(%.2f,%.2f,%.2f,a=%.2f)", c1[0], c1[1], c1[2], c1[3]))
+                                .append(" ***");
+                    } else {
+                        sb.append(" -> opaque-shadowed (dark)");
+                    }
+                }
             }
         }
         sb.append('\n').append(diagSals());
@@ -4896,7 +5064,12 @@ public final class IrisPipeline {
                 + " | salsCheck=" + (salsCount > 0 ? String.format("%.2f", salsCheck) : "NaN(no samples)")
                 + " vs threshold=6.0 -> " + (salsCount > 0 && salsCheck > 6.0F ? "RISE" : "DECAY")
                 + " | counted=" + salsCount + "/25 litSkipped=" + litSkipped
-                + " shadowcolor1.a range=[" + (maxA < 0 ? "none" : String.format("%.3f..%.3f", minA, maxA)) + "]";
+                + " shadowcolor1.a range=[" + (maxA < 0 ? "none" : String.format("%.3f..%.3f", minA, maxA)) + "]"
+                // The VL far-field branch (beyond min(far, shadowDistance)*0.98 — at rd2 that is ~31 blocks!) skips
+                // the shadow map entirely and uses localDensity = eyeBrightnessM. These two numbers decide whether
+                // that branch GLOWS: raw eye sky-light 0..240 and the pack's smoothed 0..1 uniform.
+                + " | eyeBrightnessSky=" + this.eyeBrightnessSky
+                + " eyeBrightnessM=" + String.format("%.3f", this.eyeBrightnessMSmoothed);
     }
 
     /**
@@ -4964,7 +5137,78 @@ public final class IrisPipeline {
         if (!UNDERWATER_SHAFTS || !this.activeThisFrame || !this.shadowPass || this.targets == null) {
             return;
         }
+        // The "world continues" curtain draws immediately before the snapshot so it lands in BOTH shadowtex0 and
+        // the opaque snapshot — the maps must agree over the synthetic region or the translucent-caster branch fires.
+        drawUnloadedWorldCurtain();
         this.targets.snapshotOpaqueShadowDepth();
+    }
+
+    /** Draws the synthetic "world continues" ground annulus over the UNLOADED region — see UNLOADED_WORLD_CURTAIN. */
+    private void drawUnloadedWorldCurtain() {
+        if (!UNLOADED_WORLD_CURTAIN || this.curtainProgram == null) {
+            return;
+        }
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc.world == null) {
+            return;
+        }
+        float loadedRadius = mc.gameSettings.renderDistanceChunks * 16.0F;
+        // Once the loaded world covers the whole shadow box there is nothing left to synthesize.
+        if (loadedRadius >= shadowEyeDistance() + SHADOW_BOX_SECTION_SLACK + 32.0F) {
+            return;
+        }
+        // Curtain height = the AVERAGE heightmap of the 5x5 chunks around the camera (at rd2 that IS the loaded
+        // world), minus a little — i.e. "the world continues flat at the local surface level". The height must NOT
+        // overshoot: a curtain above the real surface intersects the sun rays of legitimate surface samples and
+        // shades the whole overworld at low sun. Slightly LOW is the safe side (surface rays rise above the plane
+        // immediately and stay lit; anything meaningfully underground is still far below it).
+        int camChunkX = (int) Math.floor(this.cameraX) >> 4;
+        int camChunkZ = (int) Math.floor(this.cameraZ) >> 4;
+        long heightSum = 0;
+        int heightCount = 0;
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dz = -2; dz <= 2; dz++) {
+                net.minecraft.world.chunk.Chunk c = mc.world.getChunk(camChunkX + dx, camChunkZ + dz);
+                if (c != null && !c.isEmpty()) {
+                    heightSum += c.getHeightValue(4, 4) + c.getHeightValue(12, 4)
+                            + c.getHeightValue(4, 12) + c.getHeightValue(12, 12);
+                    heightCount += 4;
+                }
+            }
+        }
+        if (heightCount == 0) {
+            return;
+        }
+        float y = (float) ((double) heightSum / heightCount - 2.0 - this.cameraY);
+        float inner = Math.max(16.0F, loadedRadius - 24.0F);
+        float outer = 640.0F;
+
+        this.curtainProgram.use();
+        org.joml.Matrix4f mvp = new org.joml.Matrix4f(this.shadowProjection).mul(this.shadowModelView);
+        this.curtainProgram.setMatrix4("yl_ShadowMVP", mvp);
+        this.curtainProgram.setFloat("shadowMapBias", this.shadowMapBiasThisFrame);
+
+        GlStateManager.depthMask(true);
+        GlStateManager.disableBlend();
+        GlStateManager.disableCull(); // the ortho sees the annulus from below whenever the sun is low
+        // Radial rings dense near the inner edge, where the per-vertex distortion warp curves hardest (map centre).
+        float[] radii = {inner, inner + 8, inner + 16, inner + 32, inner + 64, inner + 128, inner + 256, outer};
+        int segments = 64;
+        for (int r = 0; r < radii.length - 1; r++) {
+            float r0 = radii[r];
+            float r1 = Math.min(radii[r + 1], outer);
+            GL11.glBegin(GL11.GL_TRIANGLE_STRIP);
+            for (int s = 0; s <= segments; s++) {
+                double a = (Math.PI * 2.0 * s) / segments;
+                float ca = (float) Math.cos(a);
+                float sa = (float) Math.sin(a);
+                GL11.glVertex3f(r0 * ca, y, r0 * sa);
+                GL11.glVertex3f(r1 * ca, y, r1 * sa);
+            }
+            GL11.glEnd();
+        }
+        GlStateManager.enableCull();
+        GlslProgram.unuse();
     }
 
     /**
@@ -5965,6 +6209,29 @@ public final class IrisPipeline {
         BlockPos eyePos = new BlockPos(this.cameraX, this.cameraY + view.getEyeHeight(), this.cameraZ);
         this.eyeBrightnessSky = world.getLightFor(EnumSkyBlock.SKY, eyePos) * 16;
         this.eyeBrightnessBlock = world.getLightFor(EnumSkyBlock.BLOCK, eyePos) * 16;
+        // yl_UndergroundSurfaceY — the VL underground gate's threshold (see fixVlEmptyTexel): the local average
+        // surface height − 8, or parked at −1e6 (gate = strict no-op) once the loaded world covers the shadow box.
+        this.undergroundSurfaceY = -1.0e6F;
+        float yl$loadedRadius = mc.gameSettings.renderDistanceChunks * 16.0F;
+        if (yl$loadedRadius < shadowEyeDistance() + SHADOW_BOX_SECTION_SLACK + 32.0F) {
+            int camChunkX = (int) Math.floor(this.cameraX) >> 4;
+            int camChunkZ = (int) Math.floor(this.cameraZ) >> 4;
+            long yl$heightSum = 0;
+            int yl$heightCount = 0;
+            for (int dx = -2; dx <= 2; dx++) {
+                for (int dz = -2; dz <= 2; dz++) {
+                    net.minecraft.world.chunk.Chunk c = world.getChunk(camChunkX + dx, camChunkZ + dz);
+                    if (c != null && !c.isEmpty()) {
+                        yl$heightSum += c.getHeightValue(4, 4) + c.getHeightValue(12, 4)
+                                + c.getHeightValue(4, 12) + c.getHeightValue(12, 12);
+                        yl$heightCount += 4;
+                    }
+                }
+            }
+            if (yl$heightCount > 0) {
+                this.undergroundSurfaceY = (float) ((double) yl$heightSum / yl$heightCount - 8.0);
+            }
+        }
         // Biome precipitation type → the pack's three biome_precipitation flags (matching its custom uniforms):
         // inRainy (==1, rain — canRain() is false for deserts + snowy biomes, so rain puddles only form where it rains),
         // inSnowy (==2, snow biome), inDry (==0, neither — desert/mesa/nether-style atmosphere tweaks key on it).
@@ -6342,6 +6609,16 @@ public final class IrisPipeline {
                 GL13.glActiveTexture(GL13.GL_TEXTURE7);
                 GL11.glBindTexture(org.lwjgl.opengl.GL12.GL_TEXTURE_3D, this.customImages.textureOf("wsr_img"));
             }
+            if (DIAG_SHOW_SHADOW_BANK) { // shadow bank on units 2/3/4 — raw depths need compare OFF while viewed
+                GL13.glActiveTexture(GL13.GL_TEXTURE2);
+                GL11.glBindTexture(GL11.GL_TEXTURE_2D, this.targets.shadowDepthTexture());
+                GL11.glTexParameteri(GL11.GL_TEXTURE_2D, org.lwjgl.opengl.GL14.GL_TEXTURE_COMPARE_MODE, GL11.GL_NONE);
+                GL13.glActiveTexture(GL13.GL_TEXTURE3);
+                GL11.glBindTexture(GL11.GL_TEXTURE_2D, this.targets.shadowOpaqueDepthTexture());
+                GL11.glTexParameteri(GL11.GL_TEXTURE_2D, org.lwjgl.opengl.GL14.GL_TEXTURE_COMPARE_MODE, GL11.GL_NONE);
+                GL13.glActiveTexture(GL13.GL_TEXTURE4);
+                GL11.glBindTexture(GL11.GL_TEXTURE_2D, this.targets.shadowColor1Texture());
+            }
             GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
             GlStateManager.bindTexture(this.targets.front(FINAL_COLORTEX));
             GlStateManager.enableTexture2D();
@@ -6373,7 +6650,7 @@ public final class IrisPipeline {
             // These DIAG viewers display THROUGH the tonemap quad — when one is on, draw it even though final already
             // ran (the viewer deliberately paints its visualization over the pack's output).
             boolean diagViewer = DIAG_HAND_DEPTH || DIAG_SHOW_DEPTHTEX1 || DIAG_COLORTEX7
-                    || DIAG_REF_TEMPORAL || DIAG_COLORTEX4A || DIAG_WSR_READ;
+                    || DIAG_REF_TEMPORAL || DIAG_COLORTEX4A || DIAG_WSR_READ || DIAG_SHOW_SHADOW_BANK;
             if (ranFinal && !diagViewer) {
                 // The pack's final already drew the frame — the state resets/restores above still ran; only the
                 // overwriting tonemap draw is skipped (it would paint front(FINAL_COLORTEX) over final's output).
@@ -6399,8 +6676,23 @@ public final class IrisPipeline {
                 // display below was the v5 encode's viewer; with the encode gone it just painted the hand's material
                 // data (the "item turned green" report). Keep the branch in TONEMAP_FSH for future encodes, gate off.
                 this.tonemapProgram.setFloat("diagHandMcbl", 0.0F);
+                this.tonemapProgram.setFloat("diagShadowBank", DIAG_SHOW_SHADOW_BANK ? 1.0F : 0.0F);
                 drawFullscreenQuad();
                 GlslProgram.unuse();
+                if (DIAG_SHOW_SHADOW_BANK) {
+                    // Restore the compare modes the rest of the pipeline expects: at this point in the frame BOTH
+                    // shadow depth textures are compare-ON (setShadowCompareMode(true) ran above; the opaque snapshot
+                    // is permanently ON). Texture parameters are per-texture, so re-set them explicitly.
+                    GL13.glActiveTexture(GL13.GL_TEXTURE2);
+                    GL11.glBindTexture(GL11.GL_TEXTURE_2D, this.targets.shadowDepthTexture());
+                    GL11.glTexParameteri(GL11.GL_TEXTURE_2D, org.lwjgl.opengl.GL14.GL_TEXTURE_COMPARE_MODE,
+                            org.lwjgl.opengl.GL30.GL_COMPARE_REF_TO_TEXTURE);
+                    GL13.glActiveTexture(GL13.GL_TEXTURE3);
+                    GL11.glBindTexture(GL11.GL_TEXTURE_2D, this.targets.shadowOpaqueDepthTexture());
+                    GL11.glTexParameteri(GL11.GL_TEXTURE_2D, org.lwjgl.opengl.GL14.GL_TEXTURE_COMPARE_MODE,
+                            org.lwjgl.opengl.GL30.GL_COMPARE_REF_TO_TEXTURE);
+                    GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
+                }
             } else {
                 GlslProgram.unuse();
                 drawFullscreenQuad();
@@ -7179,6 +7471,7 @@ public final class IrisPipeline {
                 Math.round(this.eyeBrightnessSmoothY < 0.0F ? this.eyeBrightnessSky : this.eyeBrightnessSmoothY));
         // eyeBrightnessM: the pack's smooth(eyeBrightness.y/240, 5, 5) custom uniform — now actually smoothed.
         program.setFloat("eyeBrightnessM", this.eyeBrightnessMSmoothed);
+        program.setFloat("yl_UndergroundSurfaceY", this.undergroundSurfaceY); // VL underground gate (fixVlEmptyTexel)
         program.setFloat("eyeBrightnessM2", this.eyeBrightnessM2); // smoothed "eye in FULL skylight" flag (2s/2s)
         program.setFloat("eyeAltitude", (float) this.cameraY);
         // cameraPositionFract: the pack's `cameraPositionBestFract = cameraPositionFract` (common.glsl:878) — the voxel
@@ -7695,6 +7988,10 @@ public final class IrisPipeline {
         if (this.playerShadowProgram != null) {
             this.playerShadowProgram.delete();
             this.playerShadowProgram = null;
+        }
+        if (this.curtainProgram != null) {
+            this.curtainProgram.delete();
+            this.curtainProgram = null;
         }
         if (this.shadowCompProgram != null) {
             this.shadowCompProgram.delete();

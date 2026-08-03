@@ -341,6 +341,16 @@ public final class RenderTargets {
         return this.shadowDepthTex;
     }
 
+    /** DIAG: raw id of the OPAQUE-only shadow depth snapshot (shadowtex1) for the shadow-bank viewer. */
+    public int shadowOpaqueDepthTexture() {
+        return this.shadowDepthTexOpaque;
+    }
+
+    /** DIAG: raw id of shadowcolor1 (light-shaft colour + SALS height in .a) for the shadow-bank viewer. */
+    public int shadowColor1Texture() {
+        return this.shadowColorTex1;
+    }
+
     /** @return the active shadow map resolution (matches the pack's {@code shadowMapResolution} const). */
     public int shadowSize() {
         return this.shadowSize;
