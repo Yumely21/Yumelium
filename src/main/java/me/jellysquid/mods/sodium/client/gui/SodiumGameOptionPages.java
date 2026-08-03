@@ -482,6 +482,13 @@ public class SodiumGameOptionPages {
                         .setBinding((opts, value) -> opts.yumeliumPlus.dynamicLightsWithShaders = value, opts -> opts.yumeliumPlus.dynamicLightsWithShaders)
                         .setImpact(OptionImpact.MEDIUM)
                         .build())
+                .add(OptionImpl.createBuilder(boolean.class, sodiumOpts)
+                        .setName(new TextComponentTranslation("yumelium.options.debug_logging.name"))
+                        .setTooltip(new TextComponentTranslation("yumelium.options.debug_logging.tooltip"))
+                        .setControl(TickBoxControl::new)
+                        .setBinding((opts, value) -> opts.yumeliumPlus.debugLogging = value, opts -> opts.yumeliumPlus.debugLogging)
+                        .setImpact(OptionImpact.LOW)
+                        .build())
                 // The "Connected Textures" toggle is removed while the feature is disabled (see ClientProxy) — leaving a
                 // switch that does nothing would be worse than no switch. Restore this block when CTM comes back.
                 .build());

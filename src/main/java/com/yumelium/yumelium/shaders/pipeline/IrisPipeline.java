@@ -1195,8 +1195,12 @@ public final class IrisPipeline {
         return INSTANCE;
     }
 
+    /** Pipeline INFO chatter — debug-gated (yumelium_plus → debug_logging). Warnings/errors in this file go through
+     * {@code SodiumClientMod.logger().warn/error} directly and are NEVER gated. */
     private static void log(String s) {
-        SodiumClientMod.logger().info("[Iris] " + s);
+        if (SodiumClientMod.debugLogs()) {
+            SodiumClientMod.logger().info("[Iris] " + s);
+        }
     }
 
     /** Every uniform name the pipeline actually feeds (setSceneUniforms + setCompositeSamplers + sky/hand/item setters).

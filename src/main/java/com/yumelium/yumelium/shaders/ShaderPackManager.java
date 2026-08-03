@@ -39,8 +39,11 @@ public final class ShaderPackManager {
         return INSTANCE;
     }
 
+    /** Discovery detail (program rosters etc.) — debug-gated; the one-line pack inventory is always logged. */
     private static void log(String s) {
-        SodiumClientMod.logger().info("[Iris] " + s);
+        if (s.contains("available packs") || SodiumClientMod.debugLogs()) {
+            SodiumClientMod.logger().info("[Iris] " + s);
+        }
     }
 
     /** @return the {@code shaderpacks/} directory in the game folder, creating it if absent. */

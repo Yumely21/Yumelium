@@ -602,7 +602,7 @@ public class SodiumWorldRenderer {
         if (verdict == null) {
             verdict = casterClass.getName().startsWith("thebetweenlands.");
             this.iris$tesrScreened.put(casterClass, verdict);
-            if (verdict) {
+            if (verdict && SodiumClientMod.debugLogs()) {
                 SodiumClientMod.logger().info("[Iris shadow] block entity excluded from the shadow pass (its renderer "
                         + "is not safe to draw from the light's point of view): " + casterClass.getName());
             }

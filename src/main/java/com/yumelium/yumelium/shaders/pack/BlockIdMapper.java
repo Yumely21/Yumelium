@@ -468,9 +468,14 @@ public final class BlockIdMapper {
                 misses.add(base);
             }
         }
+        // The one-line coverage summary always logs (it is the mapping's health signal); the self-verification detail
+        // below (miss samples, ore-id probe, property-matching deltas, end_portal_frame split) is debug-gated.
         SodiumClientMod.logger().info("[Iris block.properties] mapped " + matched + " / " + states
                 + " block states to pack ids (" + String.format("%.1f", 100.0 * matched / Math.max(1, states)) + "%)"
                 + ", generic solid id = " + m.genericSolidId);
+        if (!SodiumClientMod.debugLogs()) {
+            return m;
+        }
         if (!misses.isEmpty()) {
             SodiumClientMod.logger().info("[Iris block.properties] blocks with NO id (sample): "
                     + String.join(", ", misses));

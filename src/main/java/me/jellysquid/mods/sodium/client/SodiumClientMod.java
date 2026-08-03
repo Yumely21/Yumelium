@@ -38,6 +38,20 @@ public class SodiumClientMod {
         return LOGGER;
     }
 
+    /**
+     * Whether verbose diagnostic logging is enabled (yumelium_plus → debug_logging, default off). Gates the INFO
+     * chatter — pack rosters, capability-probe details, pipeline init notes, id-mapping reports. Verdict lines and
+     * every warning/error are logged regardless of this flag. Exception-tolerant so ultra-early callers (before the
+     * config is loadable) simply get "quiet".
+     */
+    public static boolean debugLogs() {
+        try {
+            return options().yumeliumPlus.debugLogging;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     private static SodiumGameOptions loadConfig() {
         return SodiumGameOptions.load(Minecraft.getMinecraft().gameDir.toPath().resolve("config").resolve(MODID + "-options.json"));
     }

@@ -34,8 +34,12 @@ public class NvidiumCapabilityProbe {
         }
     }
 
+    /** Probe/self-test detail — debug-gated; VERDICT lines and the M3b availability note are always logged. The M1
+     * self-test logs through this same helper (it takes a {@code Consumer<String>}), so its verdict is covered too. */
     private static void log(String s) {
-        SodiumClientMod.logger().info("[Nvidium M0] " + s);
+        if (s.contains("VERDICT") || s.contains("[M3b]") || SodiumClientMod.debugLogs()) {
+            SodiumClientMod.logger().info("[Nvidium M0] " + s);
+        }
     }
 
     private static void run() {

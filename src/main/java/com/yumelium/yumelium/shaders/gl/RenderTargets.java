@@ -293,8 +293,12 @@ public final class RenderTargets {
     private int shadowOpaqueFbo;
     private boolean shadowCreated;
 
+    /** Targets INFO chatter — debug-gated, EXCEPT lines carrying "WARNING" (framebuffer-incomplete etc.), which are
+     * real problems and always logged. */
     private static void log(String s) {
-        SodiumClientMod.logger().info("[Iris] " + s);
+        if (s.contains("WARNING") || SodiumClientMod.debugLogs()) {
+            SodiumClientMod.logger().info("[Iris] " + s);
+        }
     }
 
     public int width() {

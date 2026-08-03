@@ -49,8 +49,11 @@ public class IrisCapabilityProbe {
         }
     }
 
+    /** Probe detail — debug-gated; the one-line VERDICT (GO/NO-GO) is always logged (support value). */
     private static void log(String s) {
-        SodiumClientMod.logger().info("[Iris] " + s);
+        if (s.contains("VERDICT") || SodiumClientMod.debugLogs()) {
+            SodiumClientMod.logger().info("[Iris] " + s);
+        }
     }
 
     private static void run() {
