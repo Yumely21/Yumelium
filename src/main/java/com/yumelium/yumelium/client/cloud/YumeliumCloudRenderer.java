@@ -51,6 +51,28 @@ public class YumeliumCloudRenderer extends IRenderHandler {
     private final ByteBuffer colorPixel = BufferUtils.createByteBuffer(4); // reused each frame (no per-frame allocation)
     private boolean buildFailed;
 
+    /**
+     * Dimensions that must never get a host cloud layer.
+     *
+     * <p>The Betweenlands is a fully enclosed swamp dimension with its own sky, fog and ceiling — a drifting vanilla
+     * cloud plane above it is simply wrong, and vanilla only omits clouds where {@code isSurfaceWorld()} is false,
+     * which that dimension does not claim. Forge routes clouds to whichever {@code IRenderHandler} the provider has,
+     * so returning here means NO clouds at all: vanilla's own {@code renderCloudsFancy} is already skipped by the
+     * handler being installed. (Skipping the registration instead would hand the dimension straight back to vanilla
+     * clouds, which is the opposite of what is wanted.)</p>
+     *
+     * <p>Matched on the provider's CLASS NAME, deliberately, not a dimension id: the Betweenlands dimension id is
+     * user-configurable, and a name test needs neither the mod on the classpath nor a class load of its types —
+     * which is the same reason the rest of the mod's Betweenlands handling is reflective (see BetweenlandsCompat and
+     * the Cleanroom classloader invariant in CLAUDE.md).</p>
+     */
+    private static boolean suppressForDimension(WorldClient world) {
+        if (world == null || world.provider == null) {
+            return false;
+        }
+        return world.provider.getClass().getName().startsWith("thebetweenlands.");
+    }
+
     @Override
     public void render(float partialTicks, WorldClient world, Minecraft mc) {
         if (this.buildFailed) {
@@ -60,6 +82,9 @@ public class YumeliumCloudRenderer extends IRenderHandler {
         // drawing this host cloud layer on top of them doubles the sky. Honoured the way Iris does: no host clouds
         // while such a pack is active; instantly back when shaders are toggled off.
         if (com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().suppressVanillaClouds()) {
+            return;
+        }
+        if (suppressForDimension(world)) {
             return;
         }
         if (this.vbo == null) {

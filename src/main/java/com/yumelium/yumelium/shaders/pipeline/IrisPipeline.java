@@ -977,16 +977,24 @@ public final class IrisPipeline {
         return !DIAG_SHADOW_PLAYER_OFF && this.enabled && this.packShadowEntities && this.playerShadowProgram != null;
     }
 
-    /** TESR block entities — chests, beds, skulls, banners, signs, shulker boxes, the spawner's mini mob — cast
-     * shadows through the same distortion program as the entity casters. DELIBERATELY ignores the pack's
-     * {@code shadowBlockEntities=false} (unlike {@code shadowEntities}, which is honoured): the REFERENCE client
-     * (Iris 1.7.6 on the user's 1.20.1) demonstrably keeps rendering block entities when the directive is false —
-     * measured 2026-07-27 at ENTITY_SHADOW=-1, overworld: mob shadows gone, chest/bed shadows present, even though
-     * Iris 1.7.6's own PropertiesPreprocessor (run standalone against this pack) emits {@code shadowBlockEntities
-     * = false} there and its parse wiring looks correct. Whatever breaks the directive's application in 1.7.6,
-     * visual parity means matching the observed behaviour, not the directive. */
+    /**
+     * TESR block entities — chests, beds, skulls, banners, signs, shulker boxes, the spawner's mini mob — cast
+     * shadows through the same distortion program as the entity casters, when the pack's {@code shadowBlockEntities}
+     * asks for it. With Complementary that means ENTITY_SHADOW = 2 ("完全"); below that the pack emits false and
+     * block entities do not cast.
+     *
+     * <p>This USED to ignore the directive and return true whenever the player-shadow program compiled, chasing
+     * visual parity with a reference Iris 1.7.6 client that demonstrably kept drawing block-entity shadows at
+     * ENTITY_SHADOW=-1 (measured 2026-07-27). That parity was not worth its cost: honouring a directive the pack
+     * did not give means invoking arbitrary third-party TESR renderers from the light's point of view inside the
+     * bound 4096² shadow framebuffer, in configurations the user never asked for. Bisected 2026-08-03 in the
+     * Betweenlands, that loop alone made the screen flash black continuously until the client died — and six of that
+     * mod's TESRs throw outright when rendered this way. Matching an observed quirk of another client is not worth
+     * running a hazardous loop the pack explicitly declined.</p>
+     */
     public boolean shadowBlockEntitiesEnabled() {
-        return !DIAG_SHADOW_PLAYER_OFF && this.enabled && this.playerShadowProgram != null;
+        return !DIAG_SHADOW_PLAYER_OFF && this.enabled && this.packShadowBlockEntities
+                && this.playerShadowProgram != null;
     }
 
     /** The shadow ortho half-extent in blocks — the entity shadow caster cull radius must match the box. LIVE value
@@ -1297,6 +1305,27 @@ public final class IrisPipeline {
 
     /** The pack program folder for the player's current dimension, per Complementary's {@code dimension.properties}:
      * nether (-1) → {@code world-1/}, end (1) → {@code world1/}, everything else → the {@code world0 = *} catch-all. */
+    /**
+     * Whether the pack's OWN clouds must be switched off for the current dimension.
+     *
+     * <p>The Betweenlands is an enclosed swamp dimension with its own sky and ceiling; a drifting cloud layer over it
+     * is wrong. Suppressing the host cloud renderer is not enough, because with a shader pack active the clouds come
+     * from the PACK — Complementary declares {@code clouds = off} precisely so it can draw its own.</p>
+     *
+     * <p>The pack cannot do this itself: its {@code dimension.properties} routes every unknown dimension to
+     * {@code world0 = *}, so the Betweenlands gets the overworld programs verbatim. Matched on the provider's CLASS
+     * NAME rather than a dimension id, which is user-configurable, and which also avoids loading the mod's types
+     * (the Cleanroom classloader invariant — see BetweenlandsCompat).</p>
+     */
+    private static boolean suppressPackCloudsForDimension(Minecraft mc) {
+        return mc.world != null && mc.world.provider != null
+                && mc.world.provider.getClass().getName().startsWith("thebetweenlands.");
+    }
+
+    /** Whether the CURRENT compiled pipeline was built with the pack's clouds forced off. Part of the recompile key
+     * alongside {@link #worldFolder}: the option is baked in as a {@code #define}, so it cannot change mid-pipeline. */
+    private boolean packCloudsSuppressed;
+
     private static String dimensionFolder(Minecraft mc) {
         if (mc.world == null) {
             return com.yumelium.yumelium.shaders.pack.ProgramSet.OVERWORLD_FOLDER;
@@ -1424,6 +1453,28 @@ public final class IrisPipeline {
         return IRIS_DEFINES + source;
     }
 
+    /** Matches the pack's cloud-style option define, whatever value the option screen last wrote into it. */
+    private static final java.util.regex.Pattern CLOUD_STYLE_DEFINE =
+            java.util.regex.Pattern.compile("#define\\s+CLOUD_STYLE_DEFINE\\s+-?\\d+");
+
+    /**
+     * Forces the pack's own clouds off in dimensions that must not have them (see
+     * {@link #suppressPackCloudsForDimension}). Pure {@code #define} rewrite — the pack on disk is untouched, and the
+     * option screen still shows/stores the player's real Cloud Style for every other dimension.
+     *
+     * <p>Complementary derives everything cloud-related from this one option:
+     * {@code CLOUD_STYLE_DEFINE == -1} means "use the profile default", any other value is the style itself, and 0 is
+     * the option screen's OFF entry ({@code value.CLOUD_STYLE_DEFINE.0=OFF}). With it at 0, {@code CLOUD_STYLE} is 0,
+     * so {@code VL_CLOUDS_ACTIVE}, {@code CLOUDS_UNBOUND} and {@code CLOUDS_REIMAGINED} are all left undefined and the
+     * sky/volumetric cloud code compiles out; {@code gbuffers_clouds} already discards for any value except 50.</p>
+     */
+    private String forcePackCloudsOff(String source) {
+        if (source == null || !this.packCloudsSuppressed) {
+            return source;
+        }
+        return CLOUD_STYLE_DEFINE.matcher(source).replaceAll("#define CLOUD_STYLE_DEFINE 0");
+    }
+
     /** Applies the active pack's option {@code #define} overrides + the Iris preprocessor defines before compilation. */
     private String applyOptions(String source) {
         if (source == null) {
@@ -1431,6 +1482,7 @@ public final class IrisPipeline {
         }
         String s = injectVlForceRayEnd(injectShaftFloorFix(injectShowVolumetricLight(injectVlBranchColors(injectHandDepthFix(injectVolumetricLightDebug(injectWsrColorOutput(
                 injectWsrColorDebug(injectRefTemporalDebug(injectWsrTraceDebug(injectIrisDefines(shaderOptions().apply(source))))))))))));
+        s = forcePackCloudsOff(s);
         // Raise the pack's Temporal Smoothing to reduce the variance-clamp flicker on bright colored light sources (see
         // TAA_SMOOTHING_OVERRIDE). Pure #define rewrite — the pack's common.glsl on disk is untouched.
         if (TAA_SMOOTHING_OVERRIDE != 3) {
@@ -5569,9 +5621,13 @@ public final class IrisPipeline {
             // images) from the new folder, and the lazy terrain/water/shadow sources (reset by destroy()) re-read it
             // before Sodium's reloaded chunk renderer compiles its programs.
             String dimFolder = dimensionFolder(mc);
-            if (!dimFolder.equals(this.worldFolder)) {
-                log("dimension change: " + this.worldFolder + " -> " + dimFolder + " — recompiling the pipeline");
+            boolean noClouds = suppressPackCloudsForDimension(mc);
+            if (!dimFolder.equals(this.worldFolder) || noClouds != this.packCloudsSuppressed) {
+                log("dimension change: " + this.worldFolder + " -> " + dimFolder
+                        + (noClouds != this.packCloudsSuppressed ? " (pack clouds " + (noClouds ? "OFF" : "on") + ")" : "")
+                        + " — recompiling the pipeline");
                 this.worldFolder = dimFolder;
+                this.packCloudsSuppressed = noClouds;
                 destroy();
             }
             initPipeline();
@@ -7505,10 +7561,10 @@ public final class IrisPipeline {
             sb.append("-- known design gaps (deliberate) --\n");
             sb.append("   * shadow FRAGMENT is a ported subset: water caustics + shaft noise + SALS heights ARE ported;"
                     + " stained-glass COLOURED shadows are not (opaque casters write a neutral tint)\n");
-            sb.append("   * entity shadow casters follow the pack's shadowEntities/shadowPlayer directives (the"
-                    + " ENTITY_SHADOW option): all in-range entities via the distortion-matching program when"
-                    + " shadowEntities, else player + vehicle only; shadowBlockEntities (TESR casters, ENTITY_SHADOW=2)"
-                    + " is NOT implemented\n");
+            sb.append("   * entity shadow casters follow the pack's shadowEntities/shadowPlayer/shadowBlockEntities"
+                    + " directives (the ENTITY_SHADOW option): all in-range entities via the distortion-matching"
+                    + " program when shadowEntities, else player + vehicle only; TESR casters only at"
+                    + " shadowBlockEntities (Complementary: ENTITY_SHADOW=2)\n");
             sb.append("   * IRIS_VERSION >= 10800 pack branches are deliberately not taken (defining it broke cameraPosition)\n");
             sb.append("   * per-stage custom texture overrides (texture.<stage>.<sampler>) are unimplemented beyond"
                     + " noise + gbuffers gaux4\n");

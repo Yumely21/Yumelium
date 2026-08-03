@@ -417,7 +417,9 @@ public class SodiumWorldRenderer {
             com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().profileSwitch("shadow_entities");
             final long iris$cpuStart = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().entityCpuMark();
             try {
-                drawEntityShadowCasters(matrices, x, y, z, iris$allEntities, iris$entityCasters);
+                if (IRIS_ENTITY_CASTERS) {
+                    drawEntityShadowCasters(matrices, x, y, z, iris$allEntities, iris$entityCasters);
+                }
             } catch (Throwable t) {
                 SodiumClientMod.logger().warn("[Iris shadow] entity shadow pass failed this frame", t);
             } finally {
@@ -501,6 +503,187 @@ public class SodiumWorldRenderer {
      * viewer info is cached with THIS frame's camera so each entity lands at its camera-relative world position,
      * which the shadow model-view then maps to light space.
      */
+    /**
+     * DIAGNOSTIC-ONLY switch for the shadow-caster GL state investigation. Captures {@code captureGlState()} at pass
+     * entry and diffs it (a) when a caster throws and (b) at pass exit, after our own restores have run. The exit
+     * diff is the one that matters: it is exactly the state this pass leaks into the rest of the frame, which is what
+     * makes ONE failing renderer corrupt every subsequent frame. Repairs nothing on purpose — the last round of
+     * guessed repairs made things worse without ever identifying the state.
+     *
+     * <p>OFF in normal play: the entry capture is a batch of {@code glGet}s on every shadow pass of every frame, which
+     * is a driver sync point for a number nobody reads. Turn it back on to resume the hunt for whatever state a
+     * failing renderer leaves behind — the one thing {@link #iris$isShadowUnsafeTesr} avoids rather than fixes.</p>
+     */
+    private static final boolean IRIS_DIAG_CASTER_STATE = false;
+    private boolean iris$stateDiffLogged;
+
+    /**
+     * BISECT SWITCH (2026-08-03), currently OFF: skips the whole entity/TESR shadow-caster pass while leaving the
+     * pack's ENTITY_SHADOW option on.
+     *
+     * <p>Every fix so far has assumed the black flashing comes from this pass, because it is what fails visibly.
+     * That was never tested. ENTITY_SHADOW is a SHADER-PACK option: turning it on also changes the pack's own GLSL
+     * (its shadow programs take different branches), so the flashing could be entirely in the pack path and nothing
+     * to do with our caster loops. With this off, the pack still runs in its ENTITY_SHADOW configuration but we draw
+     * no entity or block-entity casters at all.</p>
+     *
+     * <p>ANSWERED 2026-08-03: with this off the flashing STOPS and play continues, so the cause is inside this pass
+     * and the pack's own ENTITY_SHADOW path is exonerated. Note what that implies together with the broken-caster
+     * blacklist: after a few frames nothing throws any more, yet the flashing continued — so it is NOT the failures,
+     * it is the pass's NORMAL operation. Step 2 then narrowed it to the block-entity half, which no longer runs
+     * unless the pack's {@code shadowBlockEntities} directive asks for it (see
+     * {@code IrisPipeline.shadowBlockEntitiesEnabled} — that directive used to be ignored). Kept as a kill switch
+     * for the whole pass.</p>
+     */
+    private static final boolean IRIS_ENTITY_CASTERS = true;
+
+    /** Matrix stack depths this pass itself established, captured after our own pushes — see {@link #iris$unwindCaster}. */
+    private int iris$passModelViewDepth;
+    private int iris$passProjectionDepth;
+
+    /**
+     * Caster classes whose renderer threw in the shadow pass; never attempted again this session.
+     *
+     * <p>The state damage is repaired by {@link #iris$unwindCaster}, but the THROW itself is the expensive part:
+     * {@code TileEntityRendererDispatcher.render} wraps every failure in a {@code ReportedException}, whose
+     * constructor builds a full {@code CrashReport} — system details and all. Measured 2026-08-03 in the
+     * Betweenlands: six TESR classes failing gave 119 of those in a few seconds of play, which is the memory churn
+     * and the stutter, not the GL state.</p>
+     *
+     * <p>A renderer that cannot draw from the light's point of view will not start working later, so retrying it
+     * every frame buys nothing. The cost of giving up is that these blocks cast no shadow — already true, since the
+     * draw threw. Keyed by class: the fault is in the renderer, shared by every instance.</p>
+     */
+    private final java.util.Set<Class<?>> iris$brokenCasters = new java.util.HashSet<>();
+
+    /** @return true if this caster class already failed and must not be attempted again. */
+    private boolean iris$isBrokenCaster(Class<?> casterClass) {
+        return !this.iris$brokenCasters.isEmpty() && this.iris$brokenCasters.contains(casterClass);
+    }
+
+    /**
+     * Kill switch for {@link #iris$isShadowUnsafeTesr}: set false to attempt every TESR shadow caster again.
+     * Doing so re-enables the crash described there — it is a diagnostic lever, not a supported configuration.
+     */
+    private static final boolean IRIS_PRESCREEN_TESR_CASTERS = true;
+
+    /** Screening verdict per caster class, so the name test runs once per class rather than once per block per frame. */
+    private final java.util.Map<Class<?>, Boolean> iris$tesrScreened = new java.util.HashMap<>();
+
+    /**
+     * Refuse to draw block-entity classes that are known NOT to survive a draw from the light's point of view.
+     *
+     * <p>This has to be a PRE-screen rather than the reactive {@link #iris$brokenCasters} blacklist, because the very
+     * first failure is already fatal. Measured 2026-08-03: {@code TileEntityMudBricksSpikeTrap} throws
+     * {@code IllegalStateException: Already building!} out of {@code TexturedQuad.draw} (it re-enters
+     * {@code BufferBuilder.begin()}), and from one second after that single throw the client logs
+     * {@code GL_INVALID_OPERATION} at "Post render" EVERY frame: the screen flashes black, memory climbs, and it
+     * eventually dies. Catching the throw does not help — {@link #iris$unwindCaster} restores the matrix stacks,
+     * blend and polygon offset, yet the errors continue, so the renderer leaves behind some other state (client
+     * vertex-array state, a bound object) that we never identified. Reacting is therefore too late by construction.</p>
+     *
+     * <p>Scoped to the Betweenlands because that is the mod where the failure is measured — six of its TESRs fail in
+     * here — and its block entities are decorative enough that losing their shadows is a fair price for a client that
+     * does not die. Matched on the class NAME so no Betweenlands type is loaded (the Cleanroom classloader invariant;
+     * same reason {@code BetweenlandsCompat} uses reflection). Everything else, vanilla included, still casts.</p>
+     */
+    private boolean iris$isShadowUnsafeTesr(Class<?> casterClass) {
+        if (!IRIS_PRESCREEN_TESR_CASTERS) {
+            return false;
+        }
+        Boolean verdict = this.iris$tesrScreened.get(casterClass);
+        if (verdict == null) {
+            verdict = casterClass.getName().startsWith("thebetweenlands.");
+            this.iris$tesrScreened.put(casterClass, verdict);
+            if (verdict) {
+                SodiumClientMod.logger().info("[Iris shadow] block entity excluded from the shadow pass (its renderer "
+                        + "is not safe to draw from the light's point of view): " + casterClass.getName());
+            }
+        }
+        return verdict;
+    }
+
+    /** Record a failed caster class and report it once, with the ROOT cause (ReportedException only says
+     * "Rendering Block Entity", which names the victim rather than the fault). */
+    private void iris$noteBrokenCaster(Class<?> casterClass, Throwable cause) {
+        if (!this.iris$brokenCasters.add(casterClass)) {
+            return;
+        }
+        Throwable root = cause;
+        for (int guard = 0; guard < 8 && root != null && root.getCause() != null; guard++) {
+            root = root.getCause();
+        }
+        SodiumClientMod.logger().warn("[Iris shadow] caster renderer failed and is now EXCLUDED for this session: "
+                + casterClass.getName() + " (it casts no shadow). Root cause: " + root, cause);
+    }
+
+    /**
+     * Undo what a caster's renderer leaked when it threw.
+     *
+     * <p>Measured 2026-08-03, and identical for all six Betweenlands TESRs that fail in here:
+     * {@code mvStack:3->5 projStack:1->2 blend:false->true polyOffsetFill:true->false}. Of that, one modelview push
+     * and the projection push are ours; the REMAINING modelview push belongs to
+     * {@code TileEntityRendererDispatcher.render}, which pushes before drawing and never reaches its pop when the
+     * renderer throws. The per-caster re-asserts already reload the matrix CONTENT, which is why this hid for so
+     * long — they do not restore the DEPTH, so each failure leaves the stack one deeper. With six failing classes and
+     * several instances each, every frame, the modelview stack (32 deep on this driver) overflows within a few
+     * frames: after that every push fails, transforms use whatever is on top, and the screen flashes black while GL
+     * reports errors forever. That is the "one failure corrupts everything permanently" shape.</p>
+     *
+     * <p>Also restores the two render flags the same measurement showed leaking, both of which the shadow pass
+     * depends on: {@code GL_BLEND} must stay off for opaque casters, and {@code GL_POLYGON_OFFSET_FILL} is the depth
+     * bias {@code renderShadowPass} enabled for the whole pass.</p>
+     */
+    private void iris$unwindCaster() {
+        try {
+            iris$popMatrixStackTo(GL11.GL_PROJECTION, GL11.GL_PROJECTION_STACK_DEPTH, this.iris$passProjectionDepth);
+            iris$popMatrixStackTo(GL11.GL_MODELVIEW, GL11.GL_MODELVIEW_STACK_DEPTH, this.iris$passModelViewDepth);
+            GlStateManager.matrixMode(GL11.GL_MODELVIEW); // the mode the pass draws in
+            GlStateManager.disableBlend();
+            GL11.glEnable(GL11.GL_POLYGON_OFFSET_FILL);
+        } catch (Throwable ignored) {
+            // recovery must never itself abort the pass
+        }
+        // And the shared Tessellator. A renderer that throws between BufferBuilder.begin() and Tessellator.draw()
+        // leaves it mid-build, and the next begin() ANYWHERE throws "Already building!" — uncaught, so the client
+        // crashes to the main menu. Measured 2026-08-03: the crash landed in ParticleManager.renderParticles, an
+        // innocent bystander several stages later in the same frame.
+        //
+        // finishDrawing() is used as probe-and-repair in one because there is no public isDrawing getter: it throws
+        // "Not building!" when clean and succeeds exactly when dirty. That is ONLY acceptable here, on the failure
+        // path — an earlier version ran the same call after EVERY caster as a leak probe, where the clean case is
+        // the common one, and the resulting exception per caster per frame was itself the black-flashing and the
+        // GL-error storm. Rare path: fine. Hot path: never.
+        try {
+            net.minecraft.client.renderer.BufferBuilder buffer =
+                    net.minecraft.client.renderer.Tessellator.getInstance().getBuffer();
+            boolean wasBuilding = false;
+            try {
+                buffer.finishDrawing();
+                wasBuilding = true;
+            } catch (Throwable ignored) {
+                // was already clean
+            }
+            if (wasBuilding) {
+                buffer.reset(); // discard the partial geometry — it must never be drawn
+            }
+        } catch (Throwable ignored) {
+            // recovery must never itself abort the pass
+        }
+    }
+
+    /** Pop {@code mode}'s stack down to {@code target}. Bounded so a bad reading cannot spin, and a never-captured
+     * baseline (0) is treated as "do not guess". */
+    private static void iris$popMatrixStackTo(int mode, int depthQuery, int target) {
+        if (target <= 0) {
+            return;
+        }
+        GlStateManager.matrixMode(mode);
+        for (int guard = 0; guard < 64 && GL11.glGetInteger(depthQuery) > target; guard++) {
+            GlStateManager.popMatrix();
+        }
+    }
+
     private void drawEntityShadowCasters(ChunkRenderMatrices matrices, double x, double y, double z, boolean allEntities, boolean entityCasters) {
         Minecraft mc = this.client;
         Entity view = mc.getRenderViewEntity();
@@ -512,6 +695,12 @@ public class SodiumWorldRenderer {
         // DIAGNOSTIC: split this pass's CPU cost into setup / draws / TESR sweep — it measured ~7 ms while drawing a
         // single entity for 0.00 ms of GPU, and did not move with the entity count.
         final long iris$tSetup = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().entityCpuMark();
+        // DIAGNOSTIC ONLY (IRIS_DIAG_CASTER_STATE): what does this pass CHANGE and what does it LEAVE BEHIND?
+        // 2026-08-03: a Betweenlands TESR throwing in here corrupts GL permanently — GL_INVALID_OPERATION every frame
+        // from the exact second of the first throw. Three speculative repairs failed because nobody had established
+        // WHICH state was wrong. This build only measures; it repairs nothing.
+        final java.util.Map<String, String> iris$stateAtEntry = IRIS_DIAG_CASTER_STATE
+                ? com.yumelium.yumelium.shaders.pipeline.IrisPipeline.captureGlState() : null;
 
         // Light-POV fixed-function matrices; the distortion program warps on top of them.
         GlStateManager.matrixMode(GL11.GL_PROJECTION);
@@ -548,6 +737,10 @@ public class SodiumWorldRenderer {
         GlStateManager.enableAlpha();
 
         com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().usePlayerShadowProgram();
+        // The depths this pass owns — everything we push is already on the stacks. A caster that throws is unwound
+        // back to exactly here (see iris$unwindCaster).
+        this.iris$passModelViewDepth = GL11.glGetInteger(GL11.GL_MODELVIEW_STACK_DEPTH);
+        this.iris$passProjectionDepth = GL11.glGetInteger(GL11.GL_PROJECTION_STACK_DEPTH);
         com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().addShadowEntSetup(iris$tSetup);
         final long iris$tDraw = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().entityCpuMark();
         boolean logNow = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.DIAG_ENTITY_SHADOW
@@ -604,6 +797,9 @@ public class SodiumWorldRenderer {
                 for (Entity entity : this.world.loadedEntityList) {
                     if (entity == null || entity instanceof net.minecraft.entity.effect.EntityLightningBolt) {
                         continue;
+                    }
+                    if (iris$isBrokenCaster(entity.getClass())) {
+                        continue; // already threw once — see iris$brokenCasters
                     }
                     double dx = entity.posX - x, dy = entity.posY - y, dz = entity.posZ - z;
                     if (dx * dx + dy * dy + dz * dz > cullSq) {
@@ -665,6 +861,9 @@ public class SodiumWorldRenderer {
                         if (failMsg == null) {
                             failMsg = entity.getClass().getSimpleName() + ": " + t;
                         }
+                        iris$logStateDiff("AFTER FAILING ENTITY " + entity.getClass().getName(), iris$stateAtEntry, t);
+                        iris$unwindCaster();
+                        iris$noteBrokenCaster(entity.getClass(), t);
                     }
                 }
                 if (logNow) {
@@ -708,6 +907,9 @@ public class SodiumWorldRenderer {
                     if (dispatcher.getRenderer(te) == null) {
                         continue;
                     }
+                    if (iris$isBrokenCaster(te.getClass()) || iris$isShadowUnsafeTesr(te.getClass())) {
+                        continue; // already threw once, or known not to survive a light-POV draw
+                    }
                     try {
                         com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().usePlayerShadowProgram();
                         com.yumelium.yumelium.shaders.pipeline.IrisPipeline.instance().reassertShadowFboState();
@@ -731,6 +933,9 @@ public class SodiumWorldRenderer {
                         if (failTeMsg == null) {
                             failTeMsg = te.getClass().getSimpleName() + ": " + t;
                         }
+                        iris$logStateDiff("AFTER FAILING TESR " + te.getClass().getName(), iris$stateAtEntry, t);
+                        iris$unwindCaster();
+                        iris$noteBrokenCaster(te.getClass(), t);
                     }
                 }
                 if (logNow) {
@@ -770,6 +975,35 @@ public class SodiumWorldRenderer {
             // the END "terrain squeezed into a window-sized corner of the shadow map" corruption. Make the tracker
             // forget so every following bind is re-issued for real.
             me.jellysquid.mods.sodium.client.gl.device.RenderDevice.INSTANCE.notifyExternalStateReset();
+            // THE measurement: what does this pass leave behind that it did not arrive with, AFTER every restore
+            // above has run? Anything listed here is leaked into the rest of the frame and every frame after it —
+            // which is exactly the shape of "one failing renderer, then GL_INVALID_OPERATION forever".
+            iris$logStateDiff("PASS EXIT (after restores)", iris$stateAtEntry, null);
+        }
+    }
+
+    /**
+     * Log how GL state now differs from {@code base}. Diagnostic only — logs once per distinct label so a per-frame
+     * condition does not flood, and never throws into the caller.
+     */
+    private void iris$logStateDiff(String label, java.util.Map<String, String> base, Throwable cause) {
+        if (!IRIS_DIAG_CASTER_STATE || base == null) {
+            return;
+        }
+        try {
+            String diff = com.yumelium.yumelium.shaders.pipeline.IrisPipeline.diffGlState(base,
+                    com.yumelium.yumelium.shaders.pipeline.IrisPipeline.captureGlState());
+            if (diff.isEmpty()) {
+                return; // nothing changed — the interesting case is when this is NOT empty
+            }
+            if (this.iris$stateDiffLogged && label.startsWith("PASS EXIT")) {
+                return; // the exit diff repeats every frame once it starts; one report is enough
+            }
+            this.iris$stateDiffLogged = true;
+            SodiumClientMod.logger().warn("[Iris shadow][STATE] " + label + " :: " + diff
+                    + (cause != null ? "  (cause: " + cause + ")" : ""));
+        } catch (Throwable ignored) {
+            // a diagnostic must never break the pass
         }
     }
 
