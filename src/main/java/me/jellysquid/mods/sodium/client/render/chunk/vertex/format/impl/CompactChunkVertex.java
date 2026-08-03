@@ -130,8 +130,21 @@ public class CompactChunkVertex implements ChunkVertexType {
         MemoryUtil.memPutInt(ptr + 16, vertex.light);
     }
 
+    /**
+     * DELIBERATE upstream divergence (2026-08-03): round to nearest instead of embeddium-16.5's truncation.
+     *
+     * <p>Truncation splits coincident edges whose authored coordinates differ by a float epsilon: the Betweenlands
+     * builds many block models through its own ModelConverter, whose output lands at values like {@code 0.99999994}
+     * where the adjacent vanilla-exact face sits at {@code 1.0} — floor puts them on ADJACENT 1/2048 steps, opening a
+     * half-millimeter gap that shows as view-dependent pinprick dots along block seams (A/B-confirmed 2026-08-03:
+     * the dots vanish with the raw-float VANILLA_LIKE format). Rounding merges everything within ±1/4096 of the true
+     * value onto the same step, which covers epsilon-level model error while changing every position by at most half
+     * a quantization step (~0.24 mm — invisible). The texture encoder always rounded ({@code Math.round}); position
+     * was the odd one out. Decoders (chunk_vertex.glsl, Nvidium's mesh-shader decode) are unaffected — the layout and
+     * scale are unchanged, only which step a borderline value lands on.</p>
+     */
     private static short encodePosition(float value) {
-        return (short) ((MODEL_ORIGIN + value) * MODEL_SCALE_INV);
+        return (short) ((MODEL_ORIGIN + value) * MODEL_SCALE_INV + 0.5f);
     }
 
     public static float decodePosition(short value) {
