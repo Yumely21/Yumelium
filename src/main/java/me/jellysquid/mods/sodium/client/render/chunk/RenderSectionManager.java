@@ -190,7 +190,11 @@ public class RenderSectionManager {
     /** Belt-and-braces TTL: force a rebuild at least every N frames (~10 s at 60 fps). */
     private static final int SHADOW_LIST_MAX_AGE = 600;
 
-    /** Drop shadow-pass sections that are buried under the terrain — see {@link #isFullyUnderground}. */
+    /** Drop shadow-pass sections that are buried under the terrain — see {@link #isFullyUnderground}.
+     * NOTE (2026-08-03): bisected OFF against the BL decay-pit phantom light shafts — streaks unchanged, so this
+     * cull is EXONERATED for that bug (despite the shaft-light hole in the javadoc's soundness argument, which
+     * remains real in principle: sun through a tall open shaft reaches buried sections of neighbouring chunks
+     * crossing only air). Re-enabled. */
     private static final boolean SHADOW_CULL_UNDERGROUND = true;
     /** Blocks of slack below the chunk's lowest exposed column before a section counts as buried. One section's worth. */
     private static final int SHADOW_UNDERGROUND_MARGIN = 16;
