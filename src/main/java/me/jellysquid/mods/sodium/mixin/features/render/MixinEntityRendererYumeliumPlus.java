@@ -6,19 +6,20 @@ import net.minecraft.client.renderer.EntityRenderer;
 import net.minecraft.client.renderer.GlStateManager;
 import net.minecraft.util.EnumParticleTypes;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Yumelium Plus: skips rain/snow rendering ("Weather" toggle), disables GL fog ("Fog" toggle), and suppresses the
- * ground rain-splash particles ("Rain Splash" particle toggle) while leaving the rain ambience sound intact.
+ * Yumelium Plus: skips rain/snow rendering ("Weather" toggle), disables GL fog ("Fog" toggle), suppresses the
+ * ground rain-splash particles ("Rain Splash" particle toggle) while leaving the rain ambience sound intact,
+ * and widens the projection far clip plane so terrain is never visibly cut off when fog is disabled.
  */
 @Mixin(EntityRenderer.class)
 public class MixinEntityRendererYumeliumPlus {
-    @org.spongepowered.asm.mixin.Shadow
-    private float farPlaneDistance;
+    @Shadow private float farPlaneDistance;
 
     /**
      * Floor for the PROJECTION far plane. Vanilla clips at {@code farPlaneDistance * SQRT_2} = rd·16·√2 — at rd2
@@ -45,6 +46,37 @@ public class MixinEntityRendererYumeliumPlus {
     private float yumelium$floorProjectionFar() {
         return Math.max(net.minecraft.util.math.MathHelper.SQRT_2,
                 YUMELIUM$MIN_PROJECTION_FAR / Math.max(this.farPlaneDistance, 1.0F));
+    }
+
+    /**
+     * The sky and cloud sections build their OWN projections from plain multiples of {@code farPlaneDistance}
+     * (sky ×2 in {@code renderWorldPass}, clouds ×4 in {@code renderCloudsCheck}) — and the sun/moon quads sit at
+     * distance 100, so below rd4 (sky far = rd·16·2 < 100 ⟺ rd < 3.2) the celestials far-clip out of their own
+     * pass. That is WHY vanilla's rd4 sky gate exists. Floor the ordinal-0 field read in each method (the projection
+     * builds; the later ordinal-1 reads are the √2 restores, already consistent via the SQRT_2 redirect above):
+     * 72 → sky far ≥ 144 > 100, clouds far ≥ 288 = the main projection floor. Inert from rd5 up for the sky's
+     * purpose and rd13+ exactly like the main floor.
+     */
+    @Redirect(method = {"renderWorldPass", "renderCloudsCheck"},
+            at = @At(value = "FIELD", target = "Lnet/minecraft/client/renderer/EntityRenderer;farPlaneDistance:F",
+                    opcode = org.objectweb.asm.Opcodes.GETFIELD, ordinal = 0),
+            require = 2)
+    private float yumelium$floorSkyProjectionFar(EntityRenderer self) {
+        return Math.max(this.farPlaneDistance, YUMELIUM$MIN_PROJECTION_FAR / 4.0F);
+    }
+
+    /**
+     * Vanilla skips the ENTIRE sky section (sun, moon, stars, sky disc) below render distance 4 —
+     * {@code renderWorldPass} bc 297-301 in the Forge-patched bytecode: {@code renderDistanceChunks < 4 → jump past
+     * "sky"}. With the far-plane floors above, the sky renders fine at any distance, so lift the gate: this ordinal-0
+     * read feeds only that comparison (javap-verified — consumed by the if_icmplt and nothing else).
+     */
+    @Redirect(method = "renderWorldPass",
+            at = @At(value = "FIELD", target = "Lnet/minecraft/client/settings/GameSettings;renderDistanceChunks:I",
+                    ordinal = 0),
+            require = 1)
+    private int yumelium$alwaysRenderSky(net.minecraft.client.settings.GameSettings settings) {
+        return Math.max(settings.renderDistanceChunks, 4);
     }
 
     @Inject(method = "renderRainSnow", at = @At("HEAD"), cancellable = true)
