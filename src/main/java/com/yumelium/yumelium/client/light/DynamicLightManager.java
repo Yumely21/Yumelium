@@ -71,8 +71,9 @@ public final class DynamicLightManager {
         // A shader pack does its own handheld/entity lighting (Complementary: heldBlockLightValue + heldItemId → a
         // COLOURED light that follows the player). Ours cannot compete: it bakes a single luminance number into the chunk
         // mesh, so the light is uncoloured AND costs a re-mesh of every section it touches. Running both would double the
-        // light and keep paying that meshing cost for a worse result, so the pack wins whenever the pipeline is on.
-        if (isShaderPipelineActive()) {
+        // light and keep paying that meshing cost for a worse result, so BY DEFAULT the pack wins whenever the pipeline
+        // is on — unless the player opts in (dynamicLightsWithShaders), e.g. for packs without their own handheld light.
+        if (isShaderPipelineActive() && !SodiumClientMod.options().yumeliumPlus.dynamicLightsWithShaders) {
             clearMap();
             return;
         }

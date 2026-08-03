@@ -78,6 +78,9 @@ public class SodiumGameOptions {
         // Visual
         public BetterGrassMode betterGrass = BetterGrassMode.OFF;
         public DynamicLightsMode dynamicLights = DynamicLightsMode.OFF;
+        // Dynamic lights normally yield to an active shader pack (Complementary does its own colored handheld light);
+        // this opt-in runs them anyway — for packs without handheld light, or players who prefer the baked light.
+        public boolean dynamicLightsWithShaders = false;
         // Connected textures. The engine is ours; the tiles come from the Yumelium companion resource pack, so this is a
         // plain on/off — the old Legacy/New choice only existed to pick between two tile sets embedded in the jar, and
         // the jar no longer embeds any. With it on but no pack installed, glass just renders normally.
