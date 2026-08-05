@@ -523,6 +523,17 @@ public final class TerrainShaderTransformer {
                     // downstream (gl_FragData[0] = color) — the "transparent parts drawn as a film" report. Force
                     // survivors opaque for cutout materials only (iris_AlphaCutoff > 0.05); SOLID carries 0.0 (its
                     // textures are opaque anyway) and the water/translucent path has its own transform (must blend).
+                    // DIAG MODE (debug_logging at pipeline-compile time, toggle + R in-game): the pale_grass film
+                    // survived the parity pair, so bisect the DRAWER — extreme-discard every cutout fragment that is
+                    // not near-opaque and paint the survivors pure GREEN. MUST run BEFORE the parity force below
+                    // (which sets color.a = 1.0 and would blind the 0.9 test). Film vanishes in diag mode → the
+                    // terrain cutout path drew it (its sub-0.9 fragments are all dead now); film persists among
+                    // green plants → the terrain cutout path is EXONERATED (suspects: water program, particles,
+                    // entities, composite effects). Normal plants (binary alpha 255) stay visible as green markers.
+                    + (me.jellysquid.mods.sodium.client.SodiumClientMod.debugLogs()
+                            ? "    if (iris_AlphaCutoff > 0.05) { if (color.a <= 0.9) discard;"
+                              + " color.rgb = vec3(0.0, 1.0, 0.0); } // [yumelium DIAG] extreme discard + green survivors\n"
+                            : "")
                     + "    if (iris_AlphaCutoff > 0.05) color.a = 1.0; // [yumelium] cutout survivors draw OPAQUE (fixed-function parity)\n");
             if (replaced.equals(body)) {
                 me.jellysquid.mods.sodium.client.SodiumClientMod.logger().warn(
