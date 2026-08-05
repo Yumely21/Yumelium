@@ -47,11 +47,17 @@ public final class BetweenlandsCompat {
                 if (current) { // re-asserted every tick, so BTL's own config re-sync can't undo the yield
                     this.savedUseShader = true;
                     this.useShader.setBoolean(this.rendering, false);
+                    resetBlShaderChain(); // free the now-dormant chain's FBOs (VRAM + no half-state to resume into)
                     YumeliumMod.LOGGER.info("[compat] Betweenlands WorldShader yielded (Yumelium shaders ON)");
                 }
             } else if (this.savedUseShader != null) {
                 this.useShader.setBoolean(this.rendering, this.savedUseShader);
                 this.savedUseShader = null;
+                // THE IMPORTANT reset: re-engaging the mod's post chain mid-session on its STALE framebuffers
+                // composited a faint frozen copy of the last shaders-ON frame over the whole screen in its dimension
+                // (user-verified 2026-08-05: BL-only, screen-fixed, cured by a window resize = a buffer recreation).
+                // Deleting here makes the chain lazily rebuild from scratch on the next frame it runs.
+                resetBlShaderChain();
                 YumeliumMod.LOGGER.info("[compat] Betweenlands WorldShader restored (Yumelium shaders OFF)");
             }
         } catch (Throwable t) {
@@ -69,6 +75,36 @@ public final class BetweenlandsCompat {
         this.useShader = renderingInstance.getClass().getField("useShader");
         this.rendering = renderingInstance;
         return true;
+    }
+
+    // --- WorldShader-chain reset (the toggle-OFF afterimage fix) ----------------------------------------------------
+
+    private java.lang.reflect.Method deleteShaders; // ShaderHelper.INSTANCE.deleteShaders()
+    private Object shaderHelper;
+    private boolean resetBroken; // reflection failed once — stand down permanently (the main yield keeps working)
+
+    /**
+     * Forces The Betweenlands to rebuild its WorldShader post chain from scratch, via the mod's OWN reset —
+     * {@code ShaderHelper.deleteShaders()} is its IResourceManagerReloadListener cleanup, so it is designed to be
+     * called at any time and the chain lazily re-initializes on the next frame {@code canUseShaders()} holds.
+     * Runs on the client tick thread (GL context current — the same thread resource reloads use).
+     */
+    private void resetBlShaderChain() {
+        if (this.resetBroken) {
+            return;
+        }
+        try {
+            if (this.deleteShaders == null) {
+                Class<?> helper = Class.forName("thebetweenlands.client.render.shader.ShaderHelper");
+                this.shaderHelper = helper.getField("INSTANCE").get(null);
+                this.deleteShaders = helper.getMethod("deleteShaders");
+            }
+            this.deleteShaders.invoke(this.shaderHelper);
+        } catch (Throwable t) {
+            this.resetBroken = true;
+            YumeliumMod.LOGGER.warn("[compat] Betweenlands shader-chain reset unavailable (a stale-frame ghost may"
+                    + " appear when toggling Yumelium shaders off inside its dimension)", t);
+        }
     }
 
     // --- Sludge Menace dummy-dispatch skip (task #15, 2026-08-04) -------------------------------------------------
