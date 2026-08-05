@@ -2987,7 +2987,62 @@ public final class IrisPipeline {
         if (DIAG_D1_ENCODE && "deferred1".equals(name)) {
             fsh = injectD1Encode(fsh);
         }
+        if (D1_TRANSLUCENT_FRESNEL_FIX && "deferred1".equals(name)) {
+            fsh = fixDeferred1TranslucentFresnel(fsh);
+        }
         return GlslProgram.compile(name, applyOptions(vsh), fsh);
+    }
+
+    /** Master switch for {@link #fixDeferred1TranslucentFresnel}. */
+    private static final boolean D1_TRANSLUCENT_FRESNEL_FIX = true;
+    private boolean d1FresnelLogged;
+
+    /**
+     * Pass-order divergence fix (2026-08-05, the BL sludgy_dirt / pale_grass "gloss/film" report): real Iris runs
+     * the deferred* chain BEFORE translucents, so gbuffers_water's colortex4 write (surface normal + reflection
+     * weight — 0 for matte mat-0 modded translucents, real weights for water/glass/ice) is authoritative. Our
+     * pipeline runs deferred AFTER the water pass, and deferred1 recomputes that weight from colortex6.r — which
+     * the water program hardcodes to 1.0 for EVERY pixel it draws (its translucency flag, replace-blended via
+     * blend.gbuffers_water.colortex6=off) — so every translucent pixel got smoothness-1.0 fresnel (0.3..1.0) and
+     * composite/composite1 painted a sharp sky + sun-glint reflection over it: the wet sheen on blocks whose pack
+     * material is deliberately MATTE (Complementary's mat-0 fall-through has reflectMult = 0 and empty material
+     * branches — the "glossy default branch" theory was refuted line-by-line; camouflaged on water/glass where
+     * reflections are legitimate). 6th settings-dependent incident: needs COLORED_LIGHTING>0 +
+     * WORLD_SPACE_REFLECTIONS=1 + BLOCK_REFLECT_QUALITY>=2 to manifest.
+     *
+     * <p>Fix: under translucent-covered pixels (depthtex1 — the pre-translucent depth copy — differs from z0),
+     * PRESERVE the previous colortex4 texel (= the water program's own write) instead of deferred1's
+     * recomputation: exactly what real-Iris ordering produces. Exact depth equality is pack-idiomatic (composite1
+     * itself gates on z0 == z1) and copyDepthForWater is a bit-exact glCopyImageSubData between same-format
+     * textures. depthtex1 and colortex4 are both already declared/read in deferred1's assembled source — this fix
+     * injects ZERO declarations (the 71dc381 contains()-on-dead-text trap cannot arise). Anchor unique pack-wide
+     * (gbuffers_water's similar write appends {@code * fogAlpha}). A silent anchor miss reverts to today's sheen,
+     * never a compile break — hence the loud HIT/MISS log.</p>
+     */
+    private String fixDeferred1TranslucentFresnel(String source) {
+        if (source == null) {
+            return null;
+        }
+        String anchor = "gl_FragData[2] = vec4(mat3(gbufferModelViewInverse) * normalM, sqrt(fresnelM * color.a));";
+        if (!source.contains(anchor)) {
+            me.jellysquid.mods.sodium.client.SodiumClientMod.logger().warn(
+                    "[Yumelium] [D1 FRESNEL] anchor MISS in deferred1 (pack updated?) — matte modded translucents"
+                    + " will show the composite reflection sheen again");
+            return source;
+        }
+        String replaced = source.replace(anchor,
+                "gl_FragData[2] = (texelFetch(depthtex1, texelCoord, 0).r != z0)"
+                + " ? texelFetch(colortex4, texelCoord, 0)"
+                + " : vec4(mat3(gbufferModelViewInverse) * normalM, sqrt(fresnelM * color.a));"
+                + " // [yumelium] deferred runs AFTER water here (real Iris: before) — under translucent-covered"
+                + " pixels keep the water program's own colortex4 write (reflection weight 0 for matte mat-0"
+                + " blocks) instead of recomputing gloss from the water's hardcoded colortex6.r==1.0 flag");
+        if (!this.d1FresnelLogged) {
+            this.d1FresnelLogged = true;
+            log("[D1 FRESNEL] deferred1 translucent-fresnel preservation applied (matte modded translucents keep"
+                    + " their water-program reflection weight)");
+        }
+        return replaced;
     }
 
     /** DIAGNOSTIC (END island 1px bright silhouette line): the line is BORN in deferred1 (1px scanline: boundary
