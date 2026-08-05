@@ -6088,6 +6088,17 @@ public final class IrisPipeline {
                 GlStateManager.depthMask(true);
                 GlStateManager.depthFunc(GL11.GL_LEQUAL);
             }
+            // Blend parity for the opaque/cutout terrain passes (2026-08-04, the pale_grass translucent-film bug):
+            // vanilla draws SOLID/CUTOUT with GL_BLEND OFF (enableBlend happens only right before TRANSLUCENT), but a
+            // pipeline pass before terrain (pack sky/cloud quads) can leave blending enabled — invisible for binary
+            // 0/255 cutout textures (src alpha 1 blends to opaque), but BL pale_grass's whole body is alpha 45
+            // (0.176), so its cutout survivors BLENDED into a ghost film with shaders on while shaders off drew them
+            // opaque. Raw glDisable first (a leak via raw GL would leave GlStateManager's cache thinking blend is
+            // already off → its disable would skip), then align the cache. TRANSLUCENT keeps vanilla's blend.
+            if (!translucent) {
+                GL11.glDisable(GL11.GL_BLEND);
+                GlStateManager.disableBlend();
+            }
         }
     }
 

@@ -515,7 +515,15 @@ public final class TerrainShaderTransformer {
                     + "    if (color.a <= max(0.00001, iris_AlphaCutoff)) discard; // 6WIR4HT23 [+ yumelium per-material cutoff]\n"
                     + "#else\n"
                     + "    if (color.a * color.a <= max(0.00001, iris_AlphaCutoff)) discard; // 6WIR4HT23 [+ yumelium per-material cutoff; textureAF sqrt-boost undone]\n"
-                    + "#endif\n");
+                    + "#endif\n"
+                    // Fixed-function CUTOUT parity, second half: vanilla's alpha test is test-then-OPAQUE — a
+                    // surviving fragment draws with its alpha effectively ignored. Textures whose visible body is
+                    // low-alpha (BL pale_grass: the ENTIRE plant is alpha 45 = 0.176, zero opaque pixels) pass the
+                    // 0.1 cutoff yet kept that alpha, ghosting through any blend state or alpha-reading consumer
+                    // downstream (gl_FragData[0] = color) — the "transparent parts drawn as a film" report. Force
+                    // survivors opaque for cutout materials only (iris_AlphaCutoff > 0.05); SOLID carries 0.0 (its
+                    // textures are opaque anyway) and the water/translucent path has its own transform (must blend).
+                    + "    if (iris_AlphaCutoff > 0.05) color.a = 1.0; // [yumelium] cutout survivors draw OPAQUE (fixed-function parity)\n");
             if (replaced.equals(body)) {
                 me.jellysquid.mods.sodium.client.SodiumClientMod.logger().warn(
                         "[Yumelium] terrain alpha-cutoff anchor MISSING (pack updated?) — low-alpha 'transparent' texels"
