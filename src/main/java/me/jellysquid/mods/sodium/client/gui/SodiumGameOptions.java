@@ -75,6 +75,11 @@ public class SodiumGameOptions {
         // Camera
         public boolean screenShake = true;
 
+        // Renders the LOCAL player with the bundled Yumely21 skin (+ its arm model), regardless of session/skin
+        // servers — so dev runs (username "Developer") and offline sessions show the author's real skin. Other
+        // players are untouched. The texture ships in the jar (assets/yumelium/textures/entity/yumely21_skin.png).
+        public boolean yumely21Skin = false;
+
         // Visual
         public BetterGrassMode betterGrass = BetterGrassMode.OFF;
         public DynamicLightsMode dynamicLights = DynamicLightsMode.OFF;

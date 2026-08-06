@@ -15,6 +15,7 @@
     "features.nvidium.MixinRenderSectionManagerNvidium",
     "features.options.MixinGameOptions",
     "features.options.MixinOptionsScreen",
+    "features.render.MixinAbstractClientPlayerSkin",
     "features.render.MixinWorldDynamicLights",
     "features.render.MixinEntityRendererYumeliumPlus",
     "features.render.MixinEntityRendererZoom",
