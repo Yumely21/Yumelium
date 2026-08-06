@@ -161,6 +161,30 @@ public final class SkinLayersDecayCompat {
         }
     }
 
+    private static boolean textureBroken;
+
+    /**
+     * First-person hand path (MixinDecayRenderHandlerHand): Betweenlands' {@code renderArmFirstPersonWithDecay}
+     * binds the raw {@code player_decay.png}, whose SECOND-LAYER regions are empty — so the first-person sleeve
+     * showed no decay (the same asset gap the synthesised texture fixes for the 3D layers). Swap in the derived
+     * texture, but ONLY for the decay bind: the method also binds the player's skin for the arm base, so the
+     * caller redirects every bind and this gate matches by VALUE (no Betweenlands class references).
+     */
+    public static ResourceLocation handDecayTexture(ResourceLocation original) {
+        if (!textureBroken && DECAY_SKIN.equals(original)) {
+            try {
+                if (ensureTexture()) {
+                    return LAYERED_DECAY_SKIN;
+                }
+            } catch (Throwable t) {
+                textureBroken = true;
+                YumeliumMod.LOGGER.warn("[compat] decay hand-texture synthesis failed — first-person sleeve keeps"
+                        + " the stock (empty) overlay regions", t);
+            }
+        }
+        return original;
+    }
+
     /** One line per distinct situation, so a single test run explains itself without spamming the log. */
     private static void diagOnce(String key, String message) {
         if (diagnosed.add(key)) {
