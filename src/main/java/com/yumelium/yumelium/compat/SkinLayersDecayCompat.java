@@ -144,17 +144,33 @@ public final class SkinLayersDecayCompat {
             }
             diagOnce(body ? "drawBody" : "drawHead",
                     "drawing decay over the " + (body ? "body" : "head") + " layers, alpha=" + decayAlpha);
+            // SAVE the state this draw touches. Leaking it was the "base body renders broken" bug (2026-08-06):
+            // while the alpha capture was broken this draw never ran, but the moment it started running every
+            // frame, the blend-enable + the decay texture left bound bled into everything rendered after the
+            // skin-layer hooks — including the player's own base model on subsequent frames.
+            boolean blendWasOn = org.lwjgl.opengl.GL11.glIsEnabled(org.lwjgl.opengl.GL11.GL_BLEND);
+            int prevBlendSrc = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_BLEND_SRC);
+            int prevBlendDst = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_BLEND_DST);
             GlStateManager.enableBlend();
             GlStateManager.blendFunc(GlStateManager.SourceFactor.SRC_ALPHA,
                     GlStateManager.DestFactor.ONE_MINUS_SRC_ALPHA);
             Minecraft.getMinecraft().getTextureManager().bindTexture(LAYERED_DECAY_SKIN);
             GlStateManager.color(1.0F, 1.0F, 1.0F, decayAlpha);
-            if (body) {
-                renderLayers.invoke(layer, player, parts, scale);
-            } else {
-                renderCustomHelmet.invoke(layer, player, player, scale);
+            try {
+                if (body) {
+                    renderLayers.invoke(layer, player, parts, scale);
+                } else {
+                    renderCustomHelmet.invoke(layer, player, player, scale);
+                }
+            } finally {
+                GlStateManager.color(1.0F, 1.0F, 1.0F, 1.0F);
+                GlStateManager.blendFunc(prevBlendSrc, prevBlendDst);
+                if (!blendWasOn) {
+                    GlStateManager.disableBlend();
+                }
+                // Re-bind the player's skin — the texture every later layer/pass of this entity expects.
+                Minecraft.getMinecraft().getTextureManager().bindTexture(player.getLocationSkin());
             }
-            GlStateManager.color(1.0F, 1.0F, 1.0F, 1.0F);
         } catch (Throwable t) {
             broken = true;
             YumeliumMod.LOGGER.warn("[compat] 3dSkinLayers decay overlay disabled", t);
