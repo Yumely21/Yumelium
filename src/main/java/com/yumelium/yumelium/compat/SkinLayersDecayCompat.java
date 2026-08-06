@@ -301,14 +301,20 @@ public final class SkinLayersDecayCompat {
      * Binds the synthesised texture with its alpha channel scaled to the pulse — the ONLY way the pulse can reach
      * these draws (per-vertex colour overrides glColor; see the class doc). Quantised so camera+shadow passes and
      * consecutive frames at the same pulse step cost zero re-uploads.
+     *
+     * <p>DIAG (debug_logging, live — no reload needed): paints OUR overlay pure GREEN (alphas kept) so a
+     * screenshot separates it from Betweenlands' own base decay — anything dark that is NOT green is the mod's
+     * authentic base pass, not this compat.</p>
      */
     private static void bindAlphaScaled(float alpha) {
-        int q = Math.max(0, Math.min(255, Math.round(alpha * 255.0F)));
+        boolean diag = me.jellysquid.mods.sodium.client.SodiumClientMod.debugLogs();
+        int q = Math.max(0, Math.min(255, Math.round(alpha * 255.0F))) | (diag ? 0x10000 : 0);
         if (q != lastUploadedQ) {
+            int pulse = q & 0xFFFF;
             int[] data = dynamicTexture.getTextureData();
             for (int i = 0; i < template.length; i++) {
                 int a = template[i] >>> 24;
-                data[i] = ((a * q / 255) << 24) | (template[i] & 0x00FFFFFF);
+                data[i] = ((a * pulse / 255) << 24) | (diag ? 0x00FF00 : template[i] & 0x00FFFFFF);
             }
             dynamicTexture.updateDynamicTexture();
             lastUploadedQ = q;
