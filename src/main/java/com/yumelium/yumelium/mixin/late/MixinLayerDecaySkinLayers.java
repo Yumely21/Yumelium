@@ -4,7 +4,9 @@ import com.yumelium.yumelium.compat.SkinLayersDecayCompat;
 import net.minecraft.client.renderer.GlStateManager;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
  * LATE mixin (Betweenlands present only — see YumeliumLateMixins): snapshots the decay pass's alpha so the
@@ -20,6 +22,16 @@ import org.spongepowered.asm.mixin.injection.Redirect;
  */
 @Mixin(targets = "thebetweenlands.client.handler.DecayRenderHandler$LayerDecay")
 public class MixinLayerDecaySkinLayers {
+
+    /** Per-player snapshot reset — see {@link SkinLayersDecayCompat#clearDecayAlpha}. Runs before the decay pass
+     * decides whether to draw, so a decay-free player never inherits the previous player's alpha. */
+    @Inject(method = "doRenderLayer(Lnet/minecraft/client/entity/AbstractClientPlayer;FFFFFFF)V",
+            at = @At("HEAD"), require = 1)
+    private void yumelium$clearDecayAlpha(net.minecraft.client.entity.AbstractClientPlayer player, float limbSwing,
+                                          float limbSwingAmount, float partialTicks, float ageInTicks,
+                                          float netHeadYaw, float headPitch, float scale, CallbackInfo ci) {
+        SkinLayersDecayCompat.clearDecayAlpha();
+    }
 
     @Redirect(method = "doRenderLayer(Lnet/minecraft/client/entity/AbstractClientPlayer;FFFFFFF)V",
             at = @At(value = "INVOKE",

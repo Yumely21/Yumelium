@@ -86,12 +86,26 @@ public final class SkinLayersDecayCompat {
     }
 
     /**
-     * Called for every {@code GlStateManager.color} the Betweenlands decay pass issues. Its pre-draw call
-     * carries the pulsing alpha; its post-draw reset is a plain opaque white, which clears the snapshot so a
-     * frame without decay never paints the layers.
+     * Called for every {@code GlStateManager.color} the Betweenlands decay pass issues. Its pre-draw call carries
+     * the pulsing alpha; its post-draw opaque-white reset is IGNORED — clearing on it was the original bug
+     * (2026-08-06): the reset fires inside the same {@code doRenderLayer}, so the snapshot was gone before
+     * 3dSkinLayers' layers (which run AFTER the decay layer) could consume it — body rotted, layers stayed clean,
+     * and the log stayed silent (the draw hook exits before its first diagnostic when no alpha is set).
      */
     public static void captureDecayAlpha(float alpha) {
-        decayAlpha = alpha < 1.0F ? alpha : -1.0F;
+        if (alpha < 1.0F) {
+            decayAlpha = alpha;
+        }
+    }
+
+    /**
+     * Called at the HEAD of every {@code LayerDecay.doRenderLayer} — i.e. once per rendered player, BEFORE that
+     * player's decay pass decides whether to draw. A decayed player re-captures immediately afterwards; a
+     * decay-free player leaves the snapshot cleared, so their 3dSkinLayers parts are never painted with a
+     * previous player's alpha.
+     */
+    public static void clearDecayAlpha() {
+        decayAlpha = -1.0F;
     }
 
     public static void drawBodyDecay(AbstractClientPlayer player, float scale) {
