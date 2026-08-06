@@ -4,6 +4,9 @@
   "compatibilityLevel": "JAVA_8",
   "target": "@env(DEFAULT)",
   "client": [
+    "MixinLayerDecaySkinLayers",
+    "MixinSkinLayersBodyDecay",
+    "MixinSkinLayersHeadDecay",
     "MixinRenderDecayPitTarget",
     "MixinRenderSludgeMenace",
     "MixinRenderWallLivingRoot"
